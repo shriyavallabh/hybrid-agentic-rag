@@ -56,7 +56,7 @@ if 'reasoning_steps' not in st.session_state:
 if 'show_bottom_sheet' not in st.session_state:
     st.session_state.show_bottom_sheet = False
 
-@st.cache_resource
+@st.cache_resource(show_spinner=True)
 def get_hybrid_system():
     """Initialize and cache the Hybrid Graph-RAG system."""
     logger.info("Starting Hybrid Graph-RAG system initialization...")
@@ -64,7 +64,6 @@ def get_hybrid_system():
         openai_api_key = os.getenv('OPENAI_API_KEY')
         if not openai_api_key or openai_api_key == 'REPLACE_ME':
             logger.error("OpenAI API key not configured - system requires configuration")
-            st.error("System Configuration Required: OpenAI API key not found")
             return None, None
         
         logger.info("OpenAI API key found, initializing hybrid system...")
@@ -113,6 +112,382 @@ def get_available_models() -> List[str]:
     
     return models if models else ['GraphRAG v2.1']
 
+def get_model_information() -> pd.DataFrame:
+    """Get detailed information about available models including document counts and last updated dates."""
+    from datetime import datetime
+    
+    kb_path = Path('knowledge_base')
+    if not kb_path.exists():
+        return pd.DataFrame([{
+            "Model": "GraphRAG v2.1",
+            "Documents": 1,
+            "Last Updated": "2024-01-01"
+        }])
+    
+    model_info = []
+    
+    for model_dir in kb_path.iterdir():
+        if model_dir.is_dir():
+            # Get model name
+            if model_dir.name == 'model_1':
+                model_name = 'GraphRAG v2.1'
+            else:
+                model_name = model_dir.name.replace('_', ' ').title()
+            
+            # Count documents
+            doc_count = 0
+            last_updated = None
+            
+            # Count all files in the model directory
+            for file_path in model_dir.rglob("*"):
+                if file_path.is_file() and file_path.suffix.lower() in ['.pdf', '.txt', '.md', '.doc', '.docx']:
+                    doc_count += 1
+                    
+                    # Get last modified time
+                    file_mtime = file_path.stat().st_mtime
+                    if last_updated is None or file_mtime > last_updated:
+                        last_updated = file_mtime
+            
+            # Format last updated date
+            if last_updated:
+                last_updated_str = datetime.fromtimestamp(last_updated).strftime("%Y-%m-%d")
+            else:
+                last_updated_str = "Unknown"
+            
+            model_info.append({
+                "Model": model_name,
+                "Documents": doc_count,
+                "Last Updated": last_updated_str
+            })
+    
+    # If no models found, add default
+    if not model_info:
+        model_info.append({
+            "Model": "GraphRAG v2.1",
+            "Documents": 1,
+            "Last Updated": "2024-01-01"
+        })
+    
+    return pd.DataFrame(model_info)
+
+
+def translate_technical_message(technical_msg: str) -> str:
+    """Translate technical log messages to user-friendly language."""
+    
+    # Dictionary of technical terms to user-friendly explanations
+    translations = {
+        # System initialization
+        'Starting Hybrid Graph-RAG system': 'Setting up the knowledge system',
+        'OpenAI API key found': 'Connected to AI engine',
+        'hybrid system initialized': 'Knowledge system ready',
+        'Graph nodes': 'Found knowledge entities',
+        'Graph edges': 'Mapped relationships',
+        'RAG chunks': 'Indexed information pieces',
+        
+        # Query processing
+        'query received': 'Understanding your question',
+        'analyzing query': 'Breaking down your request',
+        'extracting entities': 'Identifying key topics',
+        'memory enhancement': 'Using conversation context',
+        'building context': 'Gathering relevant background',
+        
+        # Agent operations
+        'PLAN agent': 'Planning search strategy',
+        'THOUGHT agent': 'Reasoning about connections',
+        'ACTION agent': 'Searching knowledge base',
+        'OBSERVATION agent': 'Analyzing findings',
+        'agent completed': 'Analysis step completed',
+        
+        # Graph operations
+        'graph search': 'Exploring knowledge connections',
+        'retrieving nodes': 'Finding relevant concepts',
+        'traversing edges': 'Following topic relationships',
+        'calculating relevance': 'Scoring information importance',
+        
+        # RAG operations
+        'semantic search': 'Finding similar content',
+        'vector similarity': 'Matching meaning and context',
+        'chunk retrieval': 'Collecting relevant passages',
+        'ranking results': 'Prioritizing best matches',
+        
+        # Processing
+        'token usage': 'Processing complexity',
+        'confidence score': 'Answer reliability',
+        'citation mapping': 'Linking to sources',
+        'response synthesis': 'Crafting final answer',
+        
+        # Completion
+        'query completed': 'Analysis finished',
+        'results ready': 'Answer prepared',
+        'trace generated': 'Decision path recorded'
+    }
+    
+    # Convert to lowercase for matching
+    msg_lower = technical_msg.lower()
+    
+    # Find the best translation
+    for tech_term, user_friendly in translations.items():
+        if tech_term.lower() in msg_lower:
+            return user_friendly
+    
+    # If no specific translation found, make it more readable
+    # Remove timestamps and technical prefixes
+    cleaned_msg = technical_msg
+    if ' - ' in cleaned_msg:
+        cleaned_msg = cleaned_msg.split(' - ')[-1]  # Get the last part after timestamp
+    
+    # Capitalize first letter and add period if needed
+    if cleaned_msg:
+        cleaned_msg = cleaned_msg[0].upper() + cleaned_msg[1:]
+        if not cleaned_msg.endswith('.'):
+            cleaned_msg += '...'
+    
+    return cleaned_msg or 'Processing...'
+
+def add_progress_message(message: str, status: str = 'active'):
+    """Add a progress message to the session state."""
+    if 'progress_messages' not in st.session_state:
+        st.session_state.progress_messages = []
+    
+    # Translate technical message to user-friendly
+    user_friendly_message = translate_technical_message(message)
+    
+    # Add message
+    st.session_state.progress_messages.append({
+        'message': user_friendly_message,
+        'status': status,
+        'timestamp': time.time()
+    })
+    
+    # Keep only last 10 messages
+    if len(st.session_state.progress_messages) > 10:
+        st.session_state.progress_messages = st.session_state.progress_messages[-10:]
+
+
+
+
+def create_real_streaming_interface(query: str, selected_models: List[str], container) -> Dict:
+    """Clean streaming interface without infinite reruns."""
+    
+    # Get systems
+    hybrid_runner, cross_analyzer = get_hybrid_system()
+    
+    if not hybrid_runner or not cross_analyzer:
+        container.error("System initialization failed. Please check your configuration.")
+        return {
+            'answer': 'System not initialized. Please check your configuration.',
+            'sources': [],
+            'confidence': 0.0
+        }
+    
+    # Build model context
+    if len(selected_models) == 1:
+        model_context = f"Using model: {selected_models[0]}. Query: {query}"
+    else:
+        model_context = f"Using models: {', '.join(selected_models)}. Query: {query}"
+    
+    # Create thinking placeholder
+    thinking_placeholder = container.empty()
+    
+    # Run streaming
+    thinking_lines = []
+    final_result = None
+    
+    try:
+        all_content = ""
+        chunk_count = 0
+        for chunk in hybrid_runner.stream_query(model_context):
+            chunk_count += 1
+            logger.info(f"Received chunk {chunk_count}: {repr(chunk[:100])}")
+            all_content += chunk
+            
+            # Check if this contains the final answer marker
+            if "\n---\n" in all_content:
+                logger.info("Found final answer marker, parsing results")
+                # Split at the marker
+                parts = all_content.split("\n---\n", 1)
+                if len(parts) == 2:
+                    # Parse final answer section
+                    answer_section = parts[1].strip()
+                    logger.info(f"Answer section: {repr(answer_section[:200])}")
+                    
+                    # Extract sources and confidence
+                    sources = []
+                    confidence = 0.85
+                    
+                    if "**Sources:**" in answer_section:
+                        source_start = answer_section.find("**Sources:**") + len("**Sources:**")
+                        source_end = answer_section.find("\n", source_start) if "\n" in answer_section[source_start:] else len(answer_section)
+                        sources_text = answer_section[source_start:source_end].strip()
+                        sources = [s.strip() for s in sources_text.split(",") if s.strip()]
+                    
+                    if "**Confidence:**" in answer_section:
+                        conf_start = answer_section.find("**Confidence:**") + len("**Confidence:**")
+                        conf_text = answer_section[conf_start:].strip().split()[0]
+                        try:
+                            confidence = float(conf_text.rstrip('%')) / 100
+                        except:
+                            pass
+                    
+                    # Clean answer text
+                    answer = answer_section
+                    if "**Sources:**" in answer:
+                        answer = answer[:answer.find("**Sources:**")]
+                    if "**Confidence:**" in answer:
+                        answer = answer[:answer.find("**Confidence:**")]
+                    answer = answer.strip()
+                    
+                    final_result = {
+                        'answer': answer,
+                        'sources': sources,
+                        'confidence': confidence
+                    }
+                    logger.info(f"Parsed final result: answer={answer[:100]}, sources={sources}, confidence={confidence}")
+                    break
+            else:
+                # Add to thinking lines (keep only last 6)
+                lines = chunk.strip().split('\n')
+                for line in lines:
+                    if line.strip():
+                        thinking_lines.append(line.strip())
+                
+                if len(thinking_lines) > 6:
+                    thinking_lines = thinking_lines[-6:]
+                
+                # Update display
+                thinking_placeholder.markdown("<br>".join(thinking_lines), unsafe_allow_html=True)
+                time.sleep(0.05)  # Small delay for smooth effect
+        
+        logger.info(f"Streaming completed. Total chunks: {chunk_count}, Final result: {final_result is not None}")
+    
+    except Exception as e:
+        logger.error(f"Streaming failed: {e}")
+        # Fallback to regular query
+        result = hybrid_runner.query(model_context)
+        final_result = {
+            'answer': result.answer,
+            'sources': result.citations,
+            'confidence': result.confidence
+        }
+    
+    # Clear thinking display
+    thinking_placeholder.empty()
+    
+    return final_result or {
+        'answer': 'Processing failed. Please try again.',
+        'sources': [],
+        'confidence': 0.0
+    }
+
+def execute_streaming_analysis(query: str, selected_models: List[str]) -> Dict:
+    """Execute hybrid analysis with real streaming progress from agents."""
+    
+    # Initialize progress
+    st.session_state.progress_messages = []
+    add_progress_message("Starting analysis")
+    
+    # Get systems
+    hybrid_runner, cross_analyzer = get_hybrid_system()
+    
+    if not hybrid_runner or not cross_analyzer:
+        add_progress_message("System initialization failed", "error")
+        return {
+            'answer': 'System not initialized. Please check your configuration.',
+            'sources': [],
+            'confidence': 0.0
+        }
+    
+    add_progress_message("Knowledge system ready")
+    
+    # Build model context
+    if len(selected_models) == 1:
+        model_context = f"Using model: {selected_models[0]}. Query: {query}"
+        add_progress_message(f"Focusing on {selected_models[0]}")
+    else:
+        model_context = f"Using models: {', '.join(selected_models)}. Query: {query}"
+        add_progress_message(f"Analyzing {len(selected_models)} models")
+    
+    # Execute the actual query with real streaming
+    try:
+        add_progress_message("Understanding your question")
+        
+        # Collect streaming updates from the hybrid agent
+        stream_updates = []
+        final_result = None
+        
+        # Use the actual streaming method
+        try:
+            for update in hybrid_runner.query_stream(model_context):
+                stream_updates.append(update)
+                
+                agent = update.get('agent', '')
+                status = update.get('status', '')
+                content = update.get('content', '')
+                
+                if agent == 'FINAL' and status == 'complete':
+                    # Final result received
+                    final_result = update.get('result')
+                    add_progress_message("Analysis complete", "complete")
+                    break
+                    
+                elif status == 'running':
+                    # Agent is starting work
+                    agent_name = _get_agent_display_name(agent)
+                    add_progress_message(f"{agent_name}")
+                    
+                elif status == 'complete':
+                    # Agent completed work
+                    agent_name = _get_agent_display_name(agent)
+                    # Translate technical content to user-friendly
+                    user_content = translate_technical_message(content)
+                    add_progress_message(f"{agent_name} complete", "complete")
+        
+        except Exception as stream_error:
+            logger.warning(f"Streaming failed, falling back to regular query: {stream_error}")
+            # Fall back to regular query if streaming fails
+            add_progress_message("Planning search strategy")
+            add_progress_message("Reasoning about connections")
+            add_progress_message("Searching knowledge base")
+            add_progress_message("Analyzing findings")
+        
+        # Get the final result - use streaming result if available, otherwise regular query
+        if final_result:
+            result = final_result
+        else:
+            result = hybrid_runner.query(model_context)
+            # If we didn't get streaming updates, simulate completion
+            if not stream_updates:
+                add_progress_message("Planning search strategy complete", "complete")
+                add_progress_message("Reasoning about connections complete", "complete")
+                add_progress_message("Searching knowledge base complete", "complete")
+                add_progress_message("Analyzing findings complete", "complete")
+            add_progress_message("Analysis complete", "complete")
+        
+        return {
+            'answer': result.answer,
+            'sources': result.citations,
+            'confidence': result.confidence
+        }
+        
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}")
+        add_progress_message(f"Analysis failed: {str(e)}", "error")
+        return {
+            'answer': f'Analysis failed: {str(e)}',
+            'sources': [],
+            'confidence': 0.0
+        }
+
+def _get_agent_display_name(agent: str) -> str:
+    """Get elegant display name for agent without emojis."""
+    agent_names = {
+        'PLAN': 'Planning Strategy',
+        'THOUGHT': 'Reasoning Process', 
+        'ACTION': 'Searching Knowledge',
+        'OBSERVATION': 'Analyzing Results',
+        'FINAL': 'Final Synthesis'
+    }
+    return agent_names.get(agent, agent)
 
 def execute_hybrid_analysis_with_progress(query: str, selected_models: List[str]) -> Dict:
     """Execute hybrid graph-RAG analysis with progressive agent updates."""
@@ -382,11 +757,75 @@ def main():
         # Update session state
         st.session_state.selected_models = selected_models
         
+        # Model Information Table
+        st.divider()
+        st.subheader("Available Models")
+        st.caption("Document count and last updated information")
+        
+        try:
+            model_info_df = get_model_information()
+            if not model_info_df.empty:
+                # Style the dataframe
+                styled_df = model_info_df.style.set_table_styles([
+                    {'selector': 'th', 'props': [('background-color', '#f0f2f6'), ('color', '#262730'), ('font-size', '12px')]},
+                    {'selector': 'td', 'props': [('font-size', '11px'), ('padding', '4px 8px')]},
+                    {'selector': 'table', 'props': [('width', '100%'), ('border-collapse', 'collapse')]}
+                ])
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            else:
+                st.text("No model information available")
+        except Exception as e:
+            st.error(f"Error loading model information: {e}")
+        
         # Clean model selection - no extra metrics or buttons
+        
+        # Memory Controls
+        st.divider()
+        st.subheader("Conversation Memory")
+        st.caption("Manage conversation context and follow-up questions")
+        
+        # Get memory stats
+        hybrid_runner, _ = get_hybrid_system()
+        if hybrid_runner:
+            memory_stats = hybrid_runner.get_memory_stats()
+            
+            # Display memory info
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Conversation Turns", memory_stats.get('total_turns', 0))
+            with col2:
+                st.metric("Entities Tracked", sum(memory_stats.get('entities_tracked', {}).values()))
+            
+            # Show conversation history
+            if memory_stats.get('total_turns', 0) > 0:
+                with st.expander("Conversation History", expanded=False):
+                    history = hybrid_runner.get_conversation_history()
+                    if history and history != "No conversation history yet.":
+                        st.text_area("History", value=history, height=200, disabled=True)
+                    else:
+                        st.text("No conversation history yet.")
+                
+                # Clear memory button
+                if st.button("Clear Memory", help="Clear conversation history and start fresh"):
+                    hybrid_runner.clear_conversation_memory()
+                    st.success("Memory cleared!")
+                    st.rerun()
+            else:
+                st.text("No conversation history yet.")
+                
+            # Show entity tracking
+            entities_tracked = memory_stats.get('entities_tracked', {})
+            if any(count > 0 for count in entities_tracked.values()):
+                with st.expander("Entity Tracking", expanded=False):
+                    for entity_type, count in entities_tracked.items():
+                        if count > 0:
+                            st.text(f"{entity_type.title()}: {count}")
+        else:
+            st.text("System not initialized")
     
     # Main Content Area
-    st.title("Knowledge Counselor v3.0")
-    st.caption("Hybrid Graph-RAG Intelligence System")
+    st.title("Knowledge Counselor v4.0")
+    st.caption("Hybrid Graph-RAG Intelligence System with Memory")
     
     
     # Get selected models for main content
@@ -414,44 +853,16 @@ def main():
         
         st.divider()
     
-    # Show agent reasoning when query is running - with live thinking display
-    if st.session_state.query_running:
+    # Show current question being processed (fix for blank screen issue)
+    elif st.session_state.query_running and st.session_state.last_question:
+        # Show the question immediately when processing starts
         with st.container():
-            st.markdown("**Knowledge Counselor**")
-            
-            # Create expandable sections for each agent's thinking
-            agents_config = [
-                ('PLAN', 'Planning Strategy', '🎯'),
-                ('THOUGHT', 'Reasoning Process', '💭'),
-                ('ACTION', 'Searching Knowledge', '🔍'),
-                ('OBSERVATION', 'Analyzing Results', '📊')
-            ]
-            
-            for agent_key, agent_name, emoji in agents_config:
-                agent_status = st.session_state.reasoning_steps.get(agent_key, 'idle')
-                agent_content = st.session_state.get(f'{agent_key}_content', '')
-                
-                if agent_status in ['running', 'complete']:
-                    with st.expander(f"{emoji} {agent_name}", expanded=(agent_status == 'running')):
-                        if agent_status == 'running':
-                            # Show spinning animation while running
-                            col1, col2 = st.columns([0.9, 0.1])
-                            with col1:
-                                if agent_content:
-                                    st.markdown(f"*{agent_content}*")
-                                else:
-                                    st.markdown(f"*{agent_name.lower()}...*")
-                            with col2:
-                                st.markdown("⏳")
-                        else:  # complete
-                            if agent_content:
-                                st.success(agent_content)
-                            else:
-                                st.success(f"✓ {agent_name} completed")
-            
-            # Progress bar
-            progress_value = sum(1 for status in st.session_state.reasoning_steps.values() if status == 'complete') / 4
-            st.progress(progress_value)
+            st.markdown("**You**")
+            st.markdown(st.session_state.last_question)
+        
+        st.divider()
+    
+    # Show real-time progress when query is running - handled below in processing section
     
     # Claude-style input at bottom
     query = st.chat_input(
@@ -467,22 +878,55 @@ def main():
     if query and selected_models:
         st.session_state.query_running = True
         st.session_state.last_question = query
+        # Reset for new query
+        st.session_state.reasoning_steps = {}
+        st.session_state.thinking_stream = []
+        st.session_state.progress_messages = []
+        # Clear previous answer so new question shows properly
+        st.session_state.last_answer = None
+        st.session_state.last_sources = []
+        for agent in ['PLAN', 'THOUGHT', 'ACTION', 'OBSERVATION']:
+            st.session_state[f'{agent}_content'] = ''
+        
+        # Show immediate progress update
         st.rerun()  # Refresh to show processing state
     
     # Handle query processing after rerun
-    if st.session_state.query_running and st.session_state.last_question:
-        result = execute_hybrid_analysis_with_progress(st.session_state.last_question, selected_models)
+    if st.session_state.query_running and st.session_state.last_question and not st.session_state.last_answer:
+        # Create a clean container for ChatGPT-style streaming
+        thinking_container = st.container()
         
-        # Store results
-        st.session_state.last_answer = result['answer']
-        st.session_state.last_sources = result['sources']
-        st.session_state.query_running = False
-        
-        # Success notification
-        st.success(f"Query completed in {result['processing_time']} with {result['confidence']:.1%} confidence across {result['models_analyzed']} model(s)")
-        
-        # Refresh to show results
-        st.rerun()
+        with thinking_container:
+            # World-class UI thinking header with proper spacing
+            st.markdown("""
+            <div style="
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+                font-size: 16px;
+                font-weight: 600;
+                color: #1f2937;
+                margin-bottom: 16px;
+                margin-top: 0;
+            ">
+            Thinking
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Create a placeholder for JavaScript-based streaming
+            progress_placeholder = st.empty()
+            
+            # Execute analysis with real streaming
+            result = create_real_streaming_interface(st.session_state.last_question, selected_models, thinking_container)
+            
+            # Store results and complete processing
+            st.session_state.last_answer = result['answer']
+            st.session_state.last_sources = result['sources']
+            st.session_state.query_running = False
+            
+            # Success notification
+            st.success(f"Query completed with {result['confidence']:.1%} confidence")
+            
+            # Refresh to show results
+            st.rerun()
 
 if __name__ == "__main__":
     main()

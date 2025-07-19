@@ -1,4 +1,4 @@
-# 🚀 Production Ready: Hybrid Agentic RAG System
+# 🚀 Production Ready: Hybrid Agentic RAG System with Memory
 
 ## ✅ **ALL CRITICAL ISSUES RESOLVED**
 
@@ -40,12 +40,13 @@
 
 ### **Core Components**
 ```
-├── app.py                       # Streamlit UI (Claude-style)
+├── app.py                       # Streamlit UI (Claude-style with memory)
 ├── core/
 │   ├── hybrid_agent_runner.py   # 4-agent reasoning system
 │   ├── hybrid_graph_rag.py      # Multi-modal retrieval
 │   ├── cross_model_analyzer.py  # Cross-model comparison
-│   └── simple_graph_builder.py  # Efficient graph building
+│   ├── simple_graph_builder.py  # Efficient graph building
+│   └── conversation_memory.py   # Memory system for follow-ups
 ├── enhanced_kg/                 # Knowledge graph (47 nodes)
 ├── rag_index/                   # RAG chunks (6,923 chunks)
 └── knowledge_base/              # Source documents
@@ -66,6 +67,8 @@
 - **Technical Queries**: "How does GraphRAG work?" → Detailed explanations
 - **Performance Queries**: "What are the results?" → Metrics and evaluations
 - **Comparison Queries**: "GraphRAG vs RAG" → Intelligent comparisons
+- **Follow-up Questions**: "Tell me more about it" → Context-aware responses
+- **Memory Retention**: Multi-turn conversations with entity tracking
 
 ### **✅ Advanced Features**
 - **Real-time agent thinking**: Claude-style progressive reasoning
@@ -73,6 +76,8 @@
 - **Cross-document analysis**: Relationships across models
 - **Intelligent filtering**: PDF content prioritized over test files
 - **Comprehensive logging**: Full visibility into retrieval process
+- **Conversation Memory**: Context retention across sessions with entity tracking
+- **Smart Follow-ups**: Pronoun resolution and context-aware query enhancement
 
 ## 🚀 **DEPLOYMENT INSTRUCTIONS**
 

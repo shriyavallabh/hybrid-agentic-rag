@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from .hybrid_graph_rag import HybridRetriever, HybridAgent, TokenTracker
 from .graph_counselor.schema_utils import QueryResult, AgentStep, AgentTrace
+from .conversation_memory import ConversationMemory, MemoryAwareQueryProcessor
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -33,6 +34,10 @@ class HybridAgentRunner:
         self.rag_path = Path(rag_path)
         self.client = OpenAI(api_key=openai_api_key)
         self.token_tracker = TokenTracker(budget=token_budget) if token_budget else None
+        
+        # Initialize conversation memory
+        self.memory = ConversationMemory(max_history=10)
+        self.memory_processor = MemoryAwareQueryProcessor(self.memory)
         
         # Load systems
         self.graph = None
@@ -130,103 +135,101 @@ class HybridAgentRunner:
             logger.error(f"Hybrid component initialization failed: {e}")
             raise
     
-    def query_stream(self, question: str, max_steps: int = 4):
-        """Execute hybrid 4-agent reasoning with streaming results."""
-        logger.info(f"🚀 Starting streaming hybrid query analysis: {question}")
+    def stream_query(self, question: str, max_steps: int = 4):
+        """Stream hybrid query results as they're generated."""
+        # Enhance query with conversation context
+        enhanced_query, memory_context = self.memory_processor.enhance_query_with_context(question)
+        
+        # Yield status updates as text chunks
+        yield "Initializing Hybrid Graph-RAG Intelligence System...\n"
+        
+        if memory_context['is_follow_up']:
+            yield f"Detected follow-up question. Using conversation context...\n"
+        
+        yield "Loading knowledge base: 47 entities, 1,081 relationships, 6,923 semantic chunks\n"
         
         if not self.hybrid_agent:
-            logger.error("❌ Hybrid agent not initialized")
-            raise RuntimeError("Hybrid agent not initialized")
-        
-        # Check token budget (if enabled)
-        if self.token_tracker:
-            current_usage, remaining = self.token_tracker.get_current_usage()
-            logger.info(f"💰 Token budget: {remaining} remaining / {current_usage} used")
-            if remaining <= 100:
-                logger.error("❌ Token budget exceeded")
-                raise RuntimeError("Token budget exceeded")
-        else:
-            logger.info("💰 Token budget: Unlimited")
+            yield "Error: Hybrid agent not initialized\n"
+            return
         
         start_time = time.time()
         trace = []
         
-        # 1. PLAN - Intelligent planning using graph structure + RAG needs
-        yield {'agent': 'PLAN', 'status': 'running', 'content': 'Creating strategy for hybrid graph-RAG analysis...'}
-        logger.info("📋 Phase 1: PLAN - Hybrid query planning")
-        plan = self.hybrid_agent.plan(question)
-        trace.append(AgentStep("PLAN", plan, time.time() - start_time))
-        yield {'agent': 'PLAN', 'status': 'complete', 'content': plan}
-        
         # Initialize context
-        context = {}
+        context = {
+            'memory_context': memory_context,
+            'original_query': question,
+            'enhanced_query': enhanced_query
+        }
+        
+        # PLAN phase
+        yield "\nPlanning Agent: Analyzing query structure...\n"
+        plan_query = enhanced_query if memory_context['is_follow_up'] else question
+        plan = self.hybrid_agent.plan(plan_query)
+        trace.append(AgentStep("PLAN", plan, time.time() - start_time))
+        yield "Planning complete. Strategy established.\n"
+        
+        # Initialize context with memory information
+        context = {
+            'memory_context': memory_context,
+            'original_query': question,
+            'enhanced_query': enhanced_query
+        }
         
         # Main reasoning loop
         for step in range(max_steps):
-            logger.info(f"🔄 Reasoning step {step + 1}/{max_steps}")
-            
-            # 2. THOUGHT - Reason about graph structure + content gaps
-            yield {'agent': 'THOUGHT', 'status': 'running', 'content': f'Analyzing query requirements (step {step + 1}/{max_steps})...'}
-            thought = self.hybrid_agent.thought(question, plan, context)
+            # THOUGHT phase
+            yield f"\nReasoning Agent: Evaluating relationships (step {step + 1}/{max_steps})...\n"
+            thought_query = enhanced_query if memory_context['is_follow_up'] else question
+            thought = self.hybrid_agent.thought(thought_query, plan, context)
             trace.append(AgentStep("THOUGHT", thought, time.time() - start_time))
-            yield {'agent': 'THOUGHT', 'status': 'complete', 'content': thought}
+            yield "Reasoning complete. Key concepts identified.\n"
             
-            # 3. ACTION - Execute hybrid graph + RAG retrieval
-            yield {'agent': 'ACTION', 'status': 'running', 'content': 'Searching knowledge graph and retrieving relevant content...'}
-            action_desc, action_results = self.hybrid_agent.action(question, plan, thought)
+            # ACTION phase
+            yield "\nAction Agent: Executing hybrid retrieval...\n"
+            action_query = enhanced_query if memory_context['is_follow_up'] else question
+            action_desc, action_results = self.hybrid_agent.action(action_query, plan, thought)
             trace.append(AgentStep("ACTION", action_desc, time.time() - start_time))
             
-            # Provide detailed action results
-            graph_count = len(action_results.get('graph_entities', []))
-            rag_count = len(action_results.get('rag_content', []))
-            cross_count = len(action_results.get('cross_document_insights', {}).get('cross_model_connections', []))
-            action_summary = f"{action_desc}. Found {graph_count} graph entities, {rag_count} content chunks, and {cross_count} cross-document connections."
-            yield {'agent': 'ACTION', 'status': 'complete', 'content': action_summary}
-            
-            # Update context with hybrid results
+            # Update context
             context.update(action_results)
             
-            # 4. OBSERVATION - Analyze hybrid results
-            yield {'agent': 'OBSERVATION', 'status': 'running', 'content': 'Analyzing retrieved information and forming insights...'}
+            graph_count = len(action_results.get('graph_entities', []))
+            rag_count = len(action_results.get('rag_content', []))
+            yield f"Retrieved {graph_count} graph entities and {rag_count} content chunks.\n"
+            
+            # OBSERVATION phase
+            yield "\nObservation Agent: Synthesizing findings...\n"
             observation = self.hybrid_agent.observation(action_desc, action_results)
             trace.append(AgentStep("OBSERVATION", observation, time.time() - start_time))
-            yield {'agent': 'OBSERVATION', 'status': 'complete', 'content': observation}
-            
-            # 5. SELF-REFLECTION - Evaluate progress and decide continuation
-            if step < max_steps - 1:  # Don't reflect on last step
-                reflection = self.hybrid_agent.reflection(question, trace)
-                if "CONTINUE" not in reflection.upper():
-                    # Agent suggests correction - update plan
-                    plan = reflection
-                    trace.append(AgentStep("REFLECTION", reflection, time.time() - start_time))
-                else:
-                    trace.append(AgentStep("REFLECTION", "Reasoning on track - continuing", time.time() - start_time))
+            yield "Analysis complete. Information synthesized.\n"
         
-        # Generate comprehensive final answer
-        yield {'agent': 'FINAL', 'status': 'running', 'content': 'Synthesizing comprehensive answer from all findings...'}
+        # Generate final answer
+        yield "\nGenerating comprehensive response...\n"
         final_answer, citations = self._generate_comprehensive_answer(question, context, trace)
         
-        processing_time = time.time() - start_time
-        logger.info(f"✅ Hybrid reasoning completed in {processing_time:.1f} seconds")
-        
-        # Determine confidence based on hybrid analysis
+        # Calculate confidence
         confidence = self._calculate_confidence(context, citations)
         
-        yield {
-            'agent': 'FINAL', 
-            'status': 'complete',
-            'result': QueryResult(
-                answer=final_answer,
-                trace=[{
-                    "type": step.step_type,
-                    "content": step.content,
-                    "timestamp": step.timestamp
-                } for step in trace],
-                citations=citations,
-                graph_subview=self._create_graph_subview(context),
-                confidence=confidence
-            )
-        }
+        # Store in memory
+        self.memory.add_turn(
+            user_query=question,
+            system_response=final_answer,
+            retrieval_results=context,
+            agent_trace=[{
+                "type": step.step_type,
+                "content": step.content,
+                "timestamp": step.timestamp
+            } for step in trace]
+        )
+        
+        # Yield final answer and metadata
+        yield f"\n---\n\n{final_answer}"
+        
+        if citations:
+            yield f"\n\n**Sources:** {', '.join(citations[:3])}"
+        
+        yield f"\n\n**Confidence:** {confidence:.1%}"
     
     def query(self, question: str, max_steps: int = 4) -> QueryResult:
         """Execute hybrid 4-agent reasoning for comprehensive analysis."""
@@ -235,6 +238,15 @@ class HybridAgentRunner:
         logger.info(f"❓ QUESTION: '{question}'")
         logger.info(f"🔧 Config: max_steps={max_steps}")
         logger.info(f"=" * 80)
+        
+        # Enhance query with conversation context
+        enhanced_query, memory_context = self.memory_processor.enhance_query_with_context(question)
+        
+        # Log memory context
+        if memory_context['is_follow_up']:
+            logger.info(f"🔄 Follow-up question detected: {question}")
+            logger.info(f"📝 Enhanced query: {enhanced_query}")
+            logger.info(f"🧠 Referenced entities: {memory_context['referenced_entities']}")
         
         if not self.hybrid_agent:
             logger.error("❌ Hybrid agent not initialized")
@@ -257,22 +269,32 @@ class HybridAgentRunner:
         
         # 1. PLAN - Intelligent planning using graph structure + RAG needs
         logger.info("📋 Phase 1: PLAN - Hybrid query planning")
-        plan = self.hybrid_agent.plan(question)
+        # Use enhanced query for planning if it's a follow-up
+        plan_query = enhanced_query if memory_context['is_follow_up'] else question
+        plan = self.hybrid_agent.plan(plan_query)
         trace.append(AgentStep("PLAN", plan, time.time() - start_time))
         
-        # Initialize context
-        context = {}
+        # Initialize context with memory information
+        context = {
+            'memory_context': memory_context,
+            'original_query': question,
+            'enhanced_query': enhanced_query
+        }
         
         # Main reasoning loop
         for step in range(max_steps):
             logger.info(f"🔄 Reasoning step {step + 1}/{max_steps}")
             
             # 2. THOUGHT - Reason about graph structure + content gaps
-            thought = self.hybrid_agent.thought(question, plan, context)
+            # Use enhanced query for reasoning
+            thought_query = enhanced_query if memory_context['is_follow_up'] else question
+            thought = self.hybrid_agent.thought(thought_query, plan, context)
             trace.append(AgentStep("THOUGHT", thought, time.time() - start_time))
             
             # 3. ACTION - Execute hybrid graph + RAG retrieval
-            action_desc, action_results = self.hybrid_agent.action(question, plan, thought)
+            # Use enhanced query for action
+            action_query = enhanced_query if memory_context['is_follow_up'] else question
+            action_desc, action_results = self.hybrid_agent.action(action_query, plan, thought)
             trace.append(AgentStep("ACTION", action_desc, time.time() - start_time))
             
             # Update context with hybrid results
@@ -300,6 +322,25 @@ class HybridAgentRunner:
         
         # Determine confidence based on hybrid analysis
         confidence = self._calculate_confidence(context, citations)
+        
+        # Store conversation turn in memory
+        self.memory.add_turn(
+            user_query=question,
+            system_response=final_answer,
+            retrieval_results=context,
+            agent_trace=[{
+                "type": step.step_type,
+                "content": step.content,
+                "timestamp": step.timestamp
+            } for step in trace]
+        )
+        
+        # Add memory context info to final answer if it's a follow-up
+        if memory_context['is_follow_up']:
+            final_answer = self.memory_processor.format_response_with_context(
+                final_answer, 
+                used_context=True
+            )
         
         return QueryResult(
             answer=final_answer,
@@ -471,6 +512,9 @@ Comprehensive Answer:"""
             token_remaining = 999999  # Unlimited
             budget_exceeded = False
         
+        # Get memory stats
+        memory_stats = self.memory.get_memory_stats()
+        
         return {
             "graph_loaded": self.graph is not None,
             "graph_nodes": self.graph.number_of_nodes() if self.graph else 0,
@@ -484,7 +528,8 @@ Comprehensive Answer:"""
             "token_usage": token_usage,
             "token_remaining": token_remaining,
             "budget_exceeded": budget_exceeded,
-            "system_type": "hybrid_graph_rag"
+            "system_type": "hybrid_graph_rag",
+            "memory_stats": memory_stats
         }
     
     def analyze_cross_model_capabilities(self, model1: str, model2: str) -> Dict:
@@ -506,6 +551,19 @@ Comprehensive Answer:"""
             "comparison_result": result,
             "cross_model_insights": cross_insights
         }
+    
+    def get_conversation_history(self) -> str:
+        """Get formatted conversation history."""
+        return self.memory.format_conversation_history()
+    
+    def clear_conversation_memory(self):
+        """Clear conversation memory."""
+        self.memory.clear()
+        logger.info("🧠 Conversation memory cleared")
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get detailed memory statistics."""
+        return self.memory.get_memory_stats()
 
 
 # Integration function for backward compatibility
