@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from core.hybrid_agent_runner import HybridAgentRunner
 from core.cross_model_analyzer import CrossModelAnalyzer
+from core.auto_refresh import get_auto_refresh, start_auto_refresh
 import logging
 
 # Initialize chat log for scroll-back history
@@ -57,6 +58,12 @@ if 'reasoning_steps' not in st.session_state:
     st.session_state.reasoning_steps = {}
 if 'show_bottom_sheet' not in st.session_state:
     st.session_state.show_bottom_sheet = False
+if 'show_graph_modal' not in st.session_state:
+    st.session_state.show_graph_modal = False
+if 'auto_refresh_started' not in st.session_state:
+    st.session_state.auto_refresh_started = False
+if 'last_refresh_status' not in st.session_state:
+    st.session_state.last_refresh_status = None
 
 @st.cache_resource(show_spinner=True)
 def get_hybrid_system():
@@ -114,8 +121,16 @@ def get_available_models() -> List[str]:
     
     return models if models else ['GraphRAG v2.1']
 
+def file_count(model_path: Path) -> int:
+    """Count all processed files in a namespace folder."""
+    return sum(
+        f.is_file() 
+        for f in model_path.rglob("*") 
+        if not f.name.startswith(".")
+    )
+
 def get_model_information() -> pd.DataFrame:
-    """Get detailed information about available models including document counts and last updated dates."""
+    """Get detailed information about available models including accurate document counts and last updated dates."""
     from datetime import datetime
     
     kb_path = Path('knowledge_base')
@@ -136,16 +151,13 @@ def get_model_information() -> pd.DataFrame:
             else:
                 model_name = model_dir.name.replace('_', ' ').title()
             
-            # Count documents
-            doc_count = 0
-            last_updated = None
+            # Count all processed files (PDF, CSV, JSON, ipynb, .py, etc.)
+            doc_count = file_count(model_dir)
             
-            # Count all files in the model directory
+            # Get last updated time
+            last_updated = None
             for file_path in model_dir.rglob("*"):
-                if file_path.is_file() and file_path.suffix.lower() in ['.pdf', '.txt', '.md', '.doc', '.docx']:
-                    doc_count += 1
-                    
-                    # Get last modified time
+                if file_path.is_file() and not file_path.name.startswith("."):
                     file_mtime = file_path.stat().st_mtime
                     if last_updated is None or file_mtime > last_updated:
                         last_updated = file_mtime
@@ -172,6 +184,31 @@ def get_model_information() -> pd.DataFrame:
     
     return pd.DataFrame(model_info)
 
+def start_auto_refresh_system():
+    """Initialize and start the auto-refresh subsystem."""
+    if not st.session_state.auto_refresh_started:
+        try:
+            start_auto_refresh()
+            st.session_state.auto_refresh_started = True
+            logger.info("✅ Auto-refresh subsystem started")
+        except Exception as e:
+            logger.error(f"❌ Failed to start auto-refresh: {e}")
+            st.session_state.auto_refresh_started = False
+
+def get_refresh_status_indicator():
+    """Get visual status indicator for auto-refresh system."""
+    try:
+        auto_refresh = get_auto_refresh()
+        status = auto_refresh.get_status()
+        
+        if not status['running']:
+            return "🔴", "Auto-refresh stopped"
+        elif status['is_refreshing']:
+            return "🟡", "Refreshing knowledge base..."
+        else:
+            return "🟢", "Monitoring for changes"
+    except Exception:
+        return "⚪", "Auto-refresh unavailable"
 
 def translate_technical_message(technical_msg: str) -> str:
     """Translate technical log messages to user-friendly language."""
@@ -787,51 +824,48 @@ def main():
         except Exception as e:
             st.error(f"Error loading model information: {e}")
         
-        # Clean model selection - no extra metrics or buttons
-        
-        # Memory Controls
+        # Auto-Refresh System Status
         st.divider()
-        st.subheader("Conversation Memory")
-        st.caption("Manage conversation context and follow-up questions")
+        st.subheader("Knowledge Base Monitor")
         
-        # Get memory stats
-        hybrid_runner, _ = get_hybrid_system()
-        if hybrid_runner:
-            memory_stats = hybrid_runner.get_memory_stats()
-            
-            # Display memory info
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Conversation Turns", memory_stats.get('total_turns', 0))
-            with col2:
-                st.metric("Entities Tracked", sum(memory_stats.get('entities_tracked', {}).values()))
-            
-            # Show conversation history
-            if memory_stats.get('total_turns', 0) > 0:
-                with st.expander("Conversation History", expanded=False):
-                    history = hybrid_runner.get_conversation_history()
-                    if history and history != "No conversation history yet.":
-                        st.text_area("History", value=history, height=200, disabled=True)
-                    else:
-                        st.text("No conversation history yet.")
-                
-                # Clear memory button
-                if st.button("Clear Memory", help="Clear conversation history and start fresh"):
-                    hybrid_runner.clear_conversation_memory()
-                    st.success("Memory cleared!")
-                    st.rerun()
-            else:
-                st.text("No conversation history yet.")
-                
-            # Show entity tracking
-            entities_tracked = memory_stats.get('entities_tracked', {})
-            if any(count > 0 for count in entities_tracked.values()):
-                with st.expander("Entity Tracking", expanded=False):
-                    for entity_type, count in entities_tracked.items():
-                        if count > 0:
-                            st.text(f"{entity_type.title()}: {count}")
-        else:
-            st.text("System not initialized")
+        # Start auto-refresh system
+        start_auto_refresh_system()
+        
+        # Status indicator
+        status_icon, status_text = get_refresh_status_indicator()
+        st.markdown(f"{status_icon} **{status_text}**")
+        
+        # Manual refresh button
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Refresh Now", help="Manually trigger knowledge base refresh"):
+                try:
+                    auto_refresh = get_auto_refresh()
+                    auto_refresh.trigger_refresh()
+                    st.success("Refresh triggered!")
+                except Exception as e:
+                    st.error(f"Refresh failed: {e}")
+        
+        with col2:
+            # Show last refresh info
+            try:
+                auto_refresh = get_auto_refresh()
+                status = auto_refresh.get_status()
+                if status.get('last_refresh'):
+                    from datetime import datetime
+                    last_refresh = datetime.fromisoformat(status['last_refresh'])
+                    st.caption(f"Last: {last_refresh.strftime('%H:%M:%S')}")
+                else:
+                    st.caption("No refreshes yet")
+            except Exception:
+                st.caption("Status unavailable")
+        
+        # Explore Graph button
+        st.divider()
+        if st.button("🔍 Explore Graph", help="Interactive visualization of the knowledge graph"):
+            st.session_state.show_graph_modal = True
+        
+        # Clean model selection - no memory controls for end users
     
     # Main Content Area
     st.title("Knowledge Counselor v4.0")
@@ -860,20 +894,11 @@ def main():
             )
             st.markdown(turn["answer"], unsafe_allow_html=True)
 
-            # --- source chips ---
+            # --- elegant sources display ---
             if turn["sources"]:
-                chips = " ".join(
-                    f"<span style='background:#F1F5F9;\
-                                  color:#374151;\
-                                  padding:4px 10px;\
-                                  margin-right:4px;\
-                                  border-radius:14px;\
-                                  font-size:12px;\
-                                  font-family:monospace'>{src}</span>"
-                    for src in turn["sources"]
-                )
-                st.markdown(f"<div style='margin-top:4px'>{chips}</div>",
-                            unsafe_allow_html=True)
+                with st.expander(f"Sources ({len(turn['sources'])})", expanded=False):
+                    for path in sorted(set(turn["sources"])):
+                        st.markdown(f"• `{path}`")
 
             st.markdown("<hr style='margin:12px 0 8px 0'>", unsafe_allow_html=True)
     
@@ -947,6 +972,143 @@ def main():
             st.success(f"Query completed with {result['confidence']:.1%} confidence")
             
             # Refresh to show results in chat history
+            st.rerun()
+    
+    # Graph Explorer Modal
+    if st.session_state.show_graph_modal:
+        create_graph_modal(selected_models)
+
+def create_graph_modal(selected_models: List[str]):
+    """Create interactive graph visualization modal with Graph View 2.0."""
+    
+    # Import visualization components
+    from core.graph_visualizer import render_graph, create_graph_legend, get_graph_statistics
+    import streamlit.components.v1 as components
+    
+    # Create modal-style container  
+    with st.container():
+        # Modal header with close button
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.subheader("🔍 Knowledge Graph View 2.0")
+        with col2:
+            if st.button("✕ Close", key="close_graph_modal"):
+                st.session_state.show_graph_modal = False
+                st.rerun()
+        
+        st.divider()
+        if not selected_models:
+            st.warning("Please select at least one model to explore the graph.")
+            return
+        
+        try:
+            # Get hybrid system
+            hybrid_runner, _ = get_hybrid_system()
+            if not hybrid_runner or not hybrid_runner.graph:
+                st.error("Graph not available. System may not be initialized.")
+                return
+            
+            # Get graph and statistics
+            graph = hybrid_runner.graph
+            stats = get_graph_statistics(graph)
+            
+            # Display enhanced statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Nodes", stats['total_nodes'])
+            with col2:
+                st.metric("Edges", stats['total_edges'])
+            with col3:
+                st.metric("Density", f"{stats['density']:.3f}")
+            with col4:
+                st.metric("Connected", "Yes" if stats['is_connected'] else "No")
+            
+            # Enhanced graph visualization using graphviz with physics layout
+            if total_nodes > 0:
+                # Create a force-directed graph layout instead of hierarchical
+                dot_graph = "digraph G {\n"
+                dot_graph += "  layout=fdp;\n"  # Force-directed layout for better clustering
+                dot_graph += "  overlap=false;\n"
+                dot_graph += "  splines=true;\n"
+                dot_graph += "  node [shape=circle, style=filled];\n"
+                
+                # Show more nodes - use 40 instead of 20 for better representation
+                display_limit = min(40, total_nodes)
+                node_count = 0
+                for node, data in list(graph.nodes(data=True))[:display_limit]:
+                    node_type = data.get('type', 'unknown')
+                    
+                    # Set colors based on type (enhanced color scheme)
+                    if node_type == 'MODEL':
+                        color = "#FF6B6B"  # Red for models
+                    elif node_type == 'DATASET':
+                        color = "#34D399"  # Green for datasets
+                    elif node_type == 'METRIC':
+                        color = "#60A5FA"  # Blue for metrics
+                    elif node_type == 'AUTHOR':
+                        color = "#F59E0B"  # Orange for authors
+                    elif node_type == 'FIGURE':
+                        color = "#8B5CF6"  # Purple for figures
+                    elif node_type == 'TABLE':
+                        color = "#EC4899"  # Pink for tables
+                    else:
+                        color = "#E5E7EB"  # Default gray
+                    
+                    # Clean node name for display
+                    clean_name = str(node).replace('"', '\\"')[:20]
+                    dot_graph += f'  "{clean_name}" [fillcolor="{color}"];\n'
+                    node_count += 1
+                
+                # Add sample edges
+                edge_count = 0
+                for source, target in list(graph.edges())[:30]:  # Limit edges
+                    clean_source = str(source).replace('"', '\\"')[:20]
+                    clean_target = str(target).replace('"', '\\"')[:20]
+                    dot_graph += f'  "{clean_source}" -> "{clean_target}";\n'
+                    edge_count += 1
+                
+                dot_graph += "}"
+                
+                # Display the graph
+                st.graphviz_chart(dot_graph)
+                
+                # Controls
+                st.write("**Graph Controls:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🔍 Zoom In"):
+                        st.info("Use browser zoom controls")
+                with col2:
+                    if st.button("📐 Fit Graph"):
+                        st.info("Graph fitted to view")
+                
+                if total_nodes > display_limit:
+                    st.info(f"Showing first {display_limit} of {total_nodes} nodes for performance")
+                
+                # Add legend for node colors
+                st.write("**Node Types:**")
+                cols = st.columns(6)
+                with cols[0]:
+                    st.markdown("🔴 **MODEL**")
+                with cols[1]:  
+                    st.markdown("🟢 **DATASET**")
+                with cols[2]:
+                    st.markdown("🔵 **METRIC**")
+                with cols[3]:
+                    st.markdown("🟠 **AUTHOR**") 
+                with cols[4]:
+                    st.markdown("🟣 **FIGURE**")
+                with cols[5]:
+                    st.markdown("🩷 **TABLE**")
+            else:
+                st.warning("No graph data available")
+                
+        except Exception as e:
+            st.error(f"Error creating graph visualization: {e}")
+        
+        # Additional close button at bottom
+        if st.button("Close", type="primary", key="close_graph_modal_bottom"):
+            st.session_state.show_graph_modal = False
             st.rerun()
 
 if __name__ == "__main__":
