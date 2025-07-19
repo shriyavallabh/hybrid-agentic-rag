@@ -13,6 +13,10 @@ from core.hybrid_agent_runner import HybridAgentRunner
 from core.cross_model_analyzer import CrossModelAnalyzer
 import logging
 
+# Initialize chat log for scroll-back history
+if "chat_log" not in st.session_state:
+    st.session_state.chat_log = []  # each item: {"question": str, "answer": str, "sources": list[str]}
+
 # Graph visualization imports (lazy loading in function)
 # import matplotlib.pyplot as plt
 # import networkx as nx
@@ -43,12 +47,10 @@ st.set_page_config(
 # Initialize session state
 if 'query_running' not in st.session_state:
     st.session_state.query_running = False
-if 'last_answer' not in st.session_state:
-    st.session_state.last_answer = None
 if 'last_question' not in st.session_state:
     st.session_state.last_question = None
-if 'last_sources' not in st.session_state:
-    st.session_state.last_sources = []
+if 'last_answer' not in st.session_state:
+    st.session_state.last_answer = None
 if 'selected_models' not in st.session_state:
     st.session_state.selected_models = []
 if 'reasoning_steps' not in st.session_state:
@@ -372,6 +374,14 @@ def create_real_streaming_interface(query: str, selected_models: List[str], cont
     
     # Clear thinking display
     thinking_placeholder.empty()
+    
+    # Save successful turn to chat log
+    if final_result and final_result.get('answer') != 'Processing failed. Please try again.':
+        st.session_state.chat_log.append({
+            "question": query,
+            "answer": final_result['answer'],
+            "sources": hybrid_runner.last_sources if hybrid_runner else []
+        })
     
     return final_result or {
         'answer': 'Processing failed. Please try again.',
@@ -827,40 +837,56 @@ def main():
     st.title("Knowledge Counselor v4.0")
     st.caption("Hybrid Graph-RAG Intelligence System with Memory")
     
+    # Add CSS for chat history styling
+    st.markdown("""
+    <style>
+    div[data-testid="stVerticalBlock"] > div:has(> hr) {
+        max-height: 500px;
+        overflow-y: auto;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
     
     # Get selected models for main content
     selected_models = st.session_state.selected_models
     
-    # Claude-style clean interface
-    
-    # Show previous conversation if exists
-    if st.session_state.last_question and st.session_state.last_answer:
-        # Question
+    # ---------- CHAT HISTORY ----------
+    for turn in st.session_state.chat_log:
         with st.container():
-            st.markdown("**You**")
-            st.markdown(st.session_state.last_question)
-        
-        # Answer with Claude-style formatting
-        with st.container():
-            st.markdown("**Knowledge Counselor**")
-            st.markdown(st.session_state.last_answer)
-            
-            # Show sources if available
-            if st.session_state.last_sources:
-                with st.expander("Sources", expanded=False):
-                    for i, source in enumerate(st.session_state.last_sources):
-                        st.text(f"• {source}")
-        
-        st.divider()
+            st.markdown(
+                f"<div style='font-weight:600; color:#1E40AF;'>{turn['question']}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(turn["answer"], unsafe_allow_html=True)
+
+            # --- source chips ---
+            if turn["sources"]:
+                chips = " ".join(
+                    f"<span style='background:#F1F5F9;\
+                                  color:#374151;\
+                                  padding:4px 10px;\
+                                  margin-right:4px;\
+                                  border-radius:14px;\
+                                  font-size:12px;\
+                                  font-family:monospace'>{src}</span>"
+                    for src in turn["sources"]
+                )
+                st.markdown(f"<div style='margin-top:4px'>{chips}</div>",
+                            unsafe_allow_html=True)
+
+            st.markdown("<hr style='margin:12px 0 8px 0'>", unsafe_allow_html=True)
     
     # Show current question being processed (fix for blank screen issue)
-    elif st.session_state.query_running and st.session_state.last_question:
+    if st.session_state.query_running and st.session_state.last_question:
         # Show the question immediately when processing starts
         with st.container():
-            st.markdown("**You**")
-            st.markdown(st.session_state.last_question)
+            st.markdown(
+                f"<div style='font-weight:600; color:#1E40AF;'>{st.session_state.last_question}</div>",
+                unsafe_allow_html=True,
+            )
         
-        st.divider()
+        st.markdown("<hr style='margin:12px 0 8px 0'>", unsafe_allow_html=True)
     
     # Show real-time progress when query is running - handled below in processing section
     
@@ -882,9 +908,6 @@ def main():
         st.session_state.reasoning_steps = {}
         st.session_state.thinking_stream = []
         st.session_state.progress_messages = []
-        # Clear previous answer so new question shows properly
-        st.session_state.last_answer = None
-        st.session_state.last_sources = []
         for agent in ['PLAN', 'THOUGHT', 'ACTION', 'OBSERVATION']:
             st.session_state[f'{agent}_content'] = ''
         
@@ -892,7 +915,7 @@ def main():
         st.rerun()  # Refresh to show processing state
     
     # Handle query processing after rerun
-    if st.session_state.query_running and st.session_state.last_question and not st.session_state.last_answer:
+    if st.session_state.query_running and st.session_state.last_question:
         # Create a clean container for ChatGPT-style streaming
         thinking_container = st.container()
         
@@ -917,15 +940,13 @@ def main():
             # Execute analysis with real streaming
             result = create_real_streaming_interface(st.session_state.last_question, selected_models, thinking_container)
             
-            # Store results and complete processing
-            st.session_state.last_answer = result['answer']
-            st.session_state.last_sources = result['sources']
+            # Complete processing
             st.session_state.query_running = False
             
             # Success notification
             st.success(f"Query completed with {result['confidence']:.1%} confidence")
             
-            # Refresh to show results
+            # Refresh to show results in chat history
             st.rerun()
 
 if __name__ == "__main__":

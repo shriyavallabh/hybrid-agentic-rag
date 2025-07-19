@@ -45,6 +45,7 @@ class HybridAgentRunner:
         self.faiss_index = None
         self.hybrid_retriever = None
         self.hybrid_agent = None
+        self.last_sources = []  # Track sources for UI display
         
         self._load_hybrid_systems()
     
@@ -211,6 +212,9 @@ class HybridAgentRunner:
         # Calculate confidence
         confidence = self._calculate_confidence(context, citations)
         
+        # Store sources for UI display
+        self.last_sources = citations[:5] if citations else []
+        
         # Store in memory
         self.memory.add_turn(
             user_query=question,
@@ -319,6 +323,9 @@ class HybridAgentRunner:
         
         processing_time = time.time() - start_time
         logger.info(f"✅ Hybrid reasoning completed in {processing_time:.1f} seconds")
+        
+        # Store sources for UI display
+        self.last_sources = citations[:5] if citations else []
         
         # Determine confidence based on hybrid analysis
         confidence = self._calculate_confidence(context, citations)
