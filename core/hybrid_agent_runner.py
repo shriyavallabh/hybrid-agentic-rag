@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from .hybrid_graph_rag import HybridRetriever, HybridAgent, TokenTracker
 from .graph_counselor.schema_utils import QueryResult, AgentStep, AgentTrace
 from .conversation_memory import ConversationMemory, MemoryAwareQueryProcessor
+from .security import moderation, pii, rate_limit, safe_completion, ModerationError, RateLimitError
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -235,13 +236,59 @@ class HybridAgentRunner:
         
         yield f"\n\n**Confidence:** {confidence:.1%}"
     
+    @rate_limit.enforce
     def query(self, question: str, max_steps: int = 4) -> QueryResult:
-        """Execute hybrid 4-agent reasoning for comprehensive analysis."""
-        logger.info(f"=" * 80)
-        logger.info(f"🚀 HYBRID QUERY ANALYSIS STARTED")
-        logger.info(f"❓ QUESTION: '{question}'")
-        logger.info(f"🔧 Config: max_steps={max_steps}")
-        logger.info(f"=" * 80)
+        """Execute hybrid 4-agent reasoning with security guardrails."""
+        try:
+            # Pre-check: Validate user input
+            moderation.pre_check(question)
+            
+            # Redact PII from input
+            clean_question = pii.redact(question)
+            
+            logger.info(f"=" * 80)
+            logger.info(f"🚀 HYBRID QUERY ANALYSIS STARTED")
+            logger.info(f"❓ QUESTION: '{clean_question}'")
+            logger.info(f"🔧 Config: max_steps={max_steps}")
+            logger.info(f"=" * 80)
+            
+            # Continue with original logic using clean_question
+            return self._execute_secure_query(clean_question, max_steps)
+            
+        except (ModerationError, RateLimitError) as e:
+            logger.warning(f"Security violation: {e}")
+            # Return safe QueryResult structure
+            return QueryResult(
+                answer=safe_completion.refuse(),
+                sources=[],
+                reasoning_steps=[],
+                agent_trace=AgentTrace(
+                    steps=[],
+                    final_answer=safe_completion.refuse(),
+                    total_steps=0,
+                    success=False
+                ),
+                execution_time=0.0,
+                token_usage=0
+            )
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            return QueryResult(
+                answer=safe_completion.safe_error_response(e),
+                sources=[],
+                reasoning_steps=[],
+                agent_trace=AgentTrace(
+                    steps=[],
+                    final_answer=safe_completion.safe_error_response(e),
+                    total_steps=0,
+                    success=False
+                ),
+                execution_time=0.0,
+                token_usage=0
+            )
+    
+    def _execute_secure_query(self, question: str, max_steps: int = 4) -> QueryResult:
+        """Execute the actual query logic after security checks."""
         
         # Enhance query with conversation context
         enhanced_query, memory_context = self.memory_processor.enhance_query_with_context(question)
@@ -442,22 +489,51 @@ Instructions:
 Comprehensive Answer:"""
 
         try:
+            # Load system guard prompt
+            system_prompt = self._load_system_prompt()
+            
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=800,
-                messages=[{"role": "user", "content": answer_prompt}]
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": answer_prompt}
+                ]
             )
             
-            final_answer = response.choices[0].message.content.strip()
+            raw_answer = response.choices[0].message.content.strip()
+            
+            # Post-check: Validate AI response
+            moderation.post_check(raw_answer)
+            
+            # Redact any PII from the response
+            final_answer = pii.redact(raw_answer)
+            
             if self.token_tracker:
                 self.token_tracker.add_usage(response.usage.total_tokens)
             
             return final_answer, list(citations)
             
+        except ModerationError as e:
+            logger.warning(f"AI response failed moderation: {e}")
+            return safe_completion.refuse_with_guidance('moderation'), list(citations)
         except Exception as e:
             logger.error(f"Final answer generation failed: {e}")
-            return "Unable to generate comprehensive answer due to error.", list(citations)
+            return safe_completion.safe_error_response(e), list(citations)
+    
+    def _load_system_prompt(self) -> str:
+        """Load system guard prompt for security."""
+        try:
+            prompt_path = Path("prompts/system_guard.txt")
+            if prompt_path.exists():
+                return prompt_path.read_text(encoding='utf-8')
+            else:
+                # Fallback system prompt if file not found
+                return """You are a helpful, harmless, and honest AI assistant. Follow content policies and safety guidelines. Provide accurate, helpful responses based on the provided context."""
+        except Exception as e:
+            logger.warning(f"Failed to load system prompt: {e}")
+            return "You are a helpful and harmless AI assistant."
     
     def _calculate_confidence(self, context: Dict, citations: List[str]) -> float:
         """Calculate confidence based on hybrid analysis quality."""

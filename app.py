@@ -10,8 +10,10 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from core.hybrid_agent_runner import HybridAgentRunner
-from core.cross_model_analyzer import CrossModelAnalyzer
-from core.auto_refresh import get_auto_refresh, start_auto_refresh
+from core.cross_model_analyzer import create_cross_model_analyzer
+# Auto-refresh functionality replaced by automatic_startup
+from core.smart_rebuild_manager import get_rebuild_manager
+from core.automatic_startup import initialize_system_automatically, get_startup_manager, StartupState
 import logging
 
 # Initialize chat log for scroll-back history
@@ -64,6 +66,20 @@ if 'auto_refresh_started' not in st.session_state:
     st.session_state.auto_refresh_started = False
 if 'last_refresh_status' not in st.session_state:
     st.session_state.last_refresh_status = None
+if 'startup_check_done' not in st.session_state:
+    st.session_state.startup_check_done = False
+if 'rebuild_recommendation' not in st.session_state:
+    st.session_state.rebuild_recommendation = None
+if 'background_rebuild_running' not in st.session_state:
+    st.session_state.background_rebuild_running = False
+if 'background_rebuild_progress' not in st.session_state:
+    st.session_state.background_rebuild_progress = ""
+if 'system_ready' not in st.session_state:
+    st.session_state.system_ready = False
+if 'startup_manager_initialized' not in st.session_state:
+    st.session_state.startup_manager_initialized = False
+if 'last_startup_check' not in st.session_state:
+    st.session_state.last_startup_check = 0
 
 @st.cache_resource(show_spinner=True)
 def get_hybrid_system():
@@ -85,8 +101,11 @@ def get_hybrid_system():
             token_budget=None  # No token budget limit
         )
         
-        # Initialize cross-model analyzer
-        cross_analyzer = CrossModelAnalyzer(hybrid_runner)
+        # Initialize cross-model analyzer for comparative analysis
+        cross_analyzer = create_cross_model_analyzer()
+        
+        # Store in session state for access throughout the app
+        st.session_state.cross_analyzer = cross_analyzer
         
         # Get system status for logging
         status = hybrid_runner.get_status()
@@ -184,31 +203,100 @@ def get_model_information() -> pd.DataFrame:
     
     return pd.DataFrame(model_info)
 
+def initialize_automatic_system():
+    """Initialize the automatic startup system."""
+    current_time = time.time()
+    
+    # Only initialize once per session or if enough time has passed
+    if (not st.session_state.startup_manager_initialized or 
+        current_time - st.session_state.last_startup_check > 300):  # 5 minutes
+        
+        logger.info("🚀 Initializing automatic startup system...")
+        
+        # Initialize the automatic startup manager
+        startup_manager = initialize_system_automatically()
+        
+        st.session_state.startup_manager_initialized = True
+        st.session_state.last_startup_check = current_time
+        
+        return startup_manager
+    else:
+        # Return existing manager
+        return get_startup_manager()
+
+def check_system_readiness() -> bool:
+    """Check if the system is ready for use."""
+    try:
+        startup_manager = get_startup_manager()
+        status = startup_manager.get_status()
+        
+        # Update session state
+        st.session_state.system_ready = status['is_ready']
+        
+        # Store status for UI display
+        if status['state'] != StartupState.ERROR:
+            st.session_state.rebuild_recommendation = {
+                'should_rebuild': status['state'] == StartupState.REBUILDING,
+                'reason': status['message'],
+                'changes': {},
+                'last_build': None,
+                'total_files': 'Processing...' if not status['is_ready'] else 'Ready'
+            }
+        
+        return status['is_ready']
+        
+    except Exception as e:
+        logger.error(f"System readiness check failed: {e}")
+        st.session_state.system_ready = False
+        return False
+
 def start_auto_refresh_system():
-    """Initialize and start the auto-refresh subsystem."""
+    """Initialize and start the automatic system (replaced auto-refresh)."""
     if not st.session_state.auto_refresh_started:
         try:
-            start_auto_refresh()
+            # Auto-refresh functionality now handled by automatic_startup
+            logger.info("✅ Automatic startup system managing rebuilds")
             st.session_state.auto_refresh_started = True
-            logger.info("✅ Auto-refresh subsystem started")
         except Exception as e:
-            logger.error(f"❌ Failed to start auto-refresh: {e}")
+            logger.error(f"❌ Failed to initialize automatic system: {e}")
             st.session_state.auto_refresh_started = False
 
 def get_refresh_status_indicator():
-    """Get visual status indicator for auto-refresh system."""
+    """Get visual status indicator for automatic system."""
     try:
-        auto_refresh = get_auto_refresh()
-        status = auto_refresh.get_status()
+        startup_manager = get_startup_manager()
+        status = startup_manager.get_status()
         
-        if not status['running']:
-            return "🔴", "Auto-refresh stopped"
-        elif status['is_refreshing']:
-            return "🟡", "Refreshing knowledge base..."
+        if status['state'] == StartupState.ERROR:
+            return "🔴", "System error"
+        elif status['state'] == StartupState.REBUILDING:
+            return "🟡", "Rebuilding knowledge base..."
+        elif status['state'] == StartupState.READY:
+            return "🟢", "System ready"
         else:
-            return "🟢", "Monitoring for changes"
+            return "🟡", "Initializing..."
     except Exception:
-        return "⚪", "Auto-refresh unavailable"
+        return "⚪", "Status unavailable"
+
+def _detect_cross_model_query(query: str, selected_models: List[str]) -> bool:
+    """Detect if a query is asking for cross-model comparison."""
+    query_lower = query.lower()
+    
+    # Keywords that indicate comparison
+    comparison_keywords = [
+        'compare', 'comparison', 'vs', 'versus', 'difference', 'differences',
+        'similar', 'similarity', 'contrast', 'between', 'against'
+    ]
+    
+    # Check if query contains comparison keywords AND multiple models are selected
+    has_comparison_keywords = any(keyword in query_lower for keyword in comparison_keywords)
+    has_multiple_models = len(selected_models) > 1
+    
+    # Check if query explicitly mentions model names
+    mentions_models = any(model.lower() in query_lower for model in selected_models)
+    
+    return (has_comparison_keywords and (has_multiple_models or mentions_models))
+
 
 def translate_technical_message(technical_msg: str) -> str:
     """Translate technical log messages to user-friendly language."""
@@ -674,37 +762,43 @@ def _execute_cross_model_analysis_simple(cross_analyzer, selected_models: List[s
         st.session_state[f'{agent}_content'] = f'Analyzing cross-model relationships...'
         time.sleep(0.2)
     
-    # Execute cross-model comparison
-    if len(selected_models) == 2:
-        comparison_result = cross_analyzer.comprehensive_model_comparison(selected_models[0], selected_models[1])
+    # Execute cross-model comparison using new analyzer
+    try:
+        comparison_result = cross_analyzer.compare_models(selected_models, query)
         
         # Mark all as complete
         for agent in agents:
             st.session_state.reasoning_steps[agent] = 'complete'
             st.session_state[f'{agent}_content'] = 'Cross-model analysis completed'
         
+        # Format sources from comparison result
+        sources = []
+        for diff in comparison_result.key_differences[:3]:
+            sources.append(f"Difference: {diff.get('aspect', 'Unknown aspect')}")
+        for sim in comparison_result.similarities[:2]:
+            sources.append(f"Similarity: {sim.get('aspect', 'Unknown aspect')}")
+        
         return {
-            'answer': comparison_result['comprehensive_synthesis']['synthesis'],
-            'sources': comparison_result['comprehensive_synthesis']['sources'],
-            'confidence': comparison_result['comprehensive_synthesis']['confidence'],
+            'answer': comparison_result.comparison_summary,
+            'sources': sources,
+            'confidence': comparison_result.confidence,
             'trace': [],
             'cross_model_details': comparison_result
         }
-    else:
-        # Multiple model ecosystem analysis
-        ecosystem_result = cross_analyzer.analyze_model_ecosystem(selected_models)
+    except Exception as e:
+        logger.error(f"Cross-model analysis failed: {e}")
         
-        # Mark all as complete
+        # Mark all as complete with error
         for agent in agents:
             st.session_state.reasoning_steps[agent] = 'complete'
-            st.session_state[f'{agent}_content'] = 'Ecosystem analysis completed'
+            st.session_state[f'{agent}_content'] = 'Cross-model analysis failed'
         
         return {
-            'answer': f"Analyzed ecosystem of {len(selected_models)} models with {len(ecosystem_result['pairwise_relationships'])} pairwise relationships identified.",
+            'answer': f"Cross-model comparison failed: {e}",
             'sources': [],
-            'confidence': 0.8,
+            'confidence': 0.1,
             'trace': [],
-            'ecosystem_details': ecosystem_result
+            'cross_model_details': None
         }
 
 def _execute_cross_model_analysis(cross_analyzer, selected_models: List[str], query: str, 
@@ -724,27 +818,32 @@ def _execute_cross_model_analysis(cross_analyzer, selected_models: List[str], qu
         agent_containers[agent].success(f"{agent}: Complete")
         progress_bar.progress((i + 1) / len(agents))
     
-    # Execute cross-model comparison
-    if len(selected_models) == 2:
-        comparison_result = cross_analyzer.comprehensive_model_comparison(selected_models[0], selected_models[1])
+    # Execute cross-model comparison using new analyzer
+    try:
+        comparison_result = cross_analyzer.compare_models(selected_models, query)
+        
+        # Format sources from comparison result  
+        sources = []
+        for diff in comparison_result.key_differences[:3]:
+            sources.append(f"Difference: {diff.get('aspect', 'Unknown aspect')}")
+        for sim in comparison_result.similarities[:2]:
+            sources.append(f"Similarity: {sim.get('aspect', 'Unknown aspect')}")
         
         return {
-            'answer': comparison_result['comprehensive_synthesis']['synthesis'],
-            'sources': comparison_result['comprehensive_synthesis']['sources'],
-            'confidence': comparison_result['comprehensive_synthesis']['confidence'],
+            'answer': comparison_result.comparison_summary,
+            'sources': sources,
+            'confidence': comparison_result.confidence,
             'trace': [],
             'cross_model_details': comparison_result
         }
-    else:
-        # Multiple model ecosystem analysis
-        ecosystem_result = cross_analyzer.analyze_model_ecosystem(selected_models)
-        
+    except Exception as e:
+        logger.error(f"Cross-model analysis failed: {e}")
         return {
-            'answer': f"Analyzed ecosystem of {len(selected_models)} models with {len(ecosystem_result['pairwise_relationships'])} pairwise relationships identified.",
+            'answer': f"Cross-model comparison failed: {e}",
             'sources': [],
-            'confidence': 0.8,
+            'confidence': 0.1,
             'trace': [],
-            'ecosystem_details': ecosystem_result
+            'cross_model_details': None
         }
 
 def _execute_regular_hybrid_analysis(hybrid_runner, model_context: str, agent_containers, progress_bar, status_text) -> Dict:
@@ -777,7 +876,125 @@ def _execute_regular_hybrid_analysis(hybrid_runner, model_context: str, agent_co
         'agent_thoughts': agent_thoughts
     }
 
+def trigger_ai_rebuild() -> bool:
+    """Trigger full AI-powered rebuild of all knowledge bases."""
+    try:
+        logger.info("🤖 Starting full AI-powered rebuild...")
+        
+        from core.enhanced_graph_builder import AIGraphBuilder
+        from core.comprehensive_rag_builder import ComprehensiveRAGBuilder
+        
+        # Detect all model folders
+        kb_path = Path('knowledge_base')
+        model_folders = []
+        
+        if kb_path.exists():
+            for folder in kb_path.iterdir():
+                if folder.is_dir() and folder.name.startswith('model_'):
+                    model_folders.append(folder.name)
+        
+        if not model_folders:
+            logger.warning("No model folders found")
+            return False
+        
+        logger.info(f"🔍 Found {len(model_folders)} model folders: {model_folders}")
+        
+        # Rebuild each model
+        for model_name in model_folders:
+            logger.info(f"🔧 Rebuilding {model_name}...")
+            
+            # Create output directories
+            model_output = Path('enhanced_kg') / model_name
+            graph_output = model_output / 'graph'
+            rag_output = model_output / 'rag'
+            
+            graph_output.mkdir(parents=True, exist_ok=True)
+            rag_output.mkdir(parents=True, exist_ok=True)
+            
+            # Initialize builders
+            graph_builder = AIGraphBuilder(str(graph_output))
+            rag_builder = ComprehensiveRAGBuilder(str(rag_output))
+            
+            # Rebuild from scratch
+            model_path = kb_path / model_name
+            graph_builder.rebuild_full_graph(str(model_path))
+            rag_builder.rebuild_full_index(str(model_path))
+            
+            logger.info(f"✅ {model_name} rebuild complete")
+        
+        # Clear cached system to force reload
+        st.cache_resource.clear()
+        
+        logger.info("✅ Full AI rebuild completed successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ AI rebuild failed: {e}")
+        return False
+
+def show_loading_screen():
+    """Show loading screen while system initializes."""
+    st.title("🚀 Knowledge Counselor v4.0")
+    st.subheader("Initializing System...")
+    
+    # Get current status
+    startup_manager = get_startup_manager()
+    status = startup_manager.get_status()
+    
+    # Progress indicator
+    if status['state'] == StartupState.READY:
+        # Check if this is a quota-limited ready state
+        if "OpenAI quota exceeded" in status['message']:
+            st.warning(f"⚡ {status['message']}")
+            st.warning("💡 **OpenAI API quota exceeded** - System is using existing knowledge base data")
+            with st.expander("🔧 How to restore AI processing"):
+                st.write("1. Check your OpenAI usage: https://platform.openai.com/usage")
+                st.write("2. Upgrade your OpenAI plan if needed")
+                st.write("3. Wait for quota reset (if on free plan)")
+                st.write("4. Restart the application once quota is available")
+        else:
+            st.success(f"✅ {status['message']}")
+        st.progress(1.0)
+        return  # System is ready, exit loading screen
+    elif status['state'] == StartupState.CHECKING:
+        st.info(f"🔍 {status['message']}")
+        st.progress(0.2)
+    elif status['state'] == StartupState.REBUILDING:
+        st.warning(f"🤖 {status['message']}")
+        st.progress(0.6)
+        st.caption("⏳ This may take a few minutes for large knowledge bases...")
+    elif status['state'] == StartupState.ERROR:
+        st.error(f"❌ {status['message']}")
+        if st.button("🔄 Retry Initialization"):
+            startup_manager.force_rebuild()
+            st.rerun()
+    else:
+        st.info(f"⚙️ {status['message']}")
+        st.progress(0.1)
+    
+    # Show detailed logs in expandable section
+    if status['detailed_logs']:
+        with st.expander("📋 Detailed Progress"):
+            for log_entry in status['detailed_logs'][-5:]:  # Last 5 entries
+                st.text(log_entry)
+    
+    # Auto-refresh to update progress
+    time.sleep(2)
+    st.rerun()
+
 def main():
+    # Initialize automatic system
+    startup_manager = initialize_automatic_system()
+    
+    # Check if system is ready
+    system_ready = check_system_readiness()
+    
+    if not system_ready:
+        # Show loading screen and wait
+        show_loading_screen()
+        return
+    
+    # System is ready - show main application
     # Sidebar - Left Panel
     with st.sidebar:
         st.title("Control Panel")
@@ -824,6 +1041,119 @@ def main():
         except Exception as e:
             st.error(f"Error loading model information: {e}")
         
+        # Cross-Model Analysis Section
+        st.divider()
+        st.subheader("Cross-Model Analysis")
+        st.caption("Compare functionality across multiple models")
+        
+        # Check if cross-analyzer is available
+        if hasattr(st.session_state, 'cross_analyzer'):
+            cross_analyzer = st.session_state.cross_analyzer
+            
+            # Get cross-model statistics
+            try:
+                stats = cross_analyzer.get_model_statistics()
+                
+                # Display overview
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Models", stats.get('total_models', 0))
+                    st.metric("Cross-Relationships", stats.get('cross_relationships', 0))
+                with col2:
+                    st.metric("Total Entities", f"{stats.get('total_entities', 0):,}")
+                    st.metric("Total Size", f"{stats.get('total_size_mb', 0):.1f} MB")
+                
+                # Model comparison selector
+                if len(available_models) >= 2:
+                    st.subheader("Compare Models")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        model_a = st.selectbox(
+                            "First Model:", 
+                            available_models,
+                            key="compare_model_a"
+                        )
+                    with col2:
+                        model_b = st.selectbox(
+                            "Second Model:", 
+                            [m for m in available_models if m != model_a],
+                            key="compare_model_b"
+                        )
+                    
+                    comparison_query = st.text_input(
+                        "Comparison Focus:",
+                        placeholder="e.g., authentication, data processing, API design",
+                        help="What aspect would you like to compare?"
+                    )
+                    
+                    if st.button("🔍 Compare Models", disabled=not comparison_query):
+                        with st.spinner(f"Comparing {model_a} vs {model_b}..."):
+                            try:
+                                comparison = cross_analyzer.compare_models(
+                                    [model_a, model_b], 
+                                    comparison_query
+                                )
+                                
+                                # Store comparison result in session state
+                                st.session_state.last_comparison = comparison
+                                st.success("✅ Comparison complete! Check the main chat area.")
+                                
+                            except Exception as e:
+                                st.error(f"Comparison failed: {e}")
+                    
+                    # AI Processing Controls
+                    st.subheader("🤖 AI Processing")
+                    
+                    # Current AI settings
+                    enable_auto_rebuild = os.getenv('ENABLE_AUTO_AI_REBUILD', '1') == '1'
+                    
+                    # Status indicator
+                    st.metric("Auto AI Rebuild", "✅ Enabled" if enable_auto_rebuild else "⏸️ Paused")
+                    
+                    # Manual operations
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("🔨 Build Cross-Model Index", 
+                                   help="Build AI-powered relationships between models"):
+                            with st.spinner("Building cross-model relationships..."):
+                                try:
+                                    cross_analyzer.build_cross_model_relationships()
+                                    st.success("✅ Cross-model relationships built!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to build relationships: {e}")
+                    
+                    with col2:
+                        if st.button("🚀 Force Full Rebuild", 
+                                   help="Trigger complete AI rebuild of all models"):
+                            with st.spinner("Running full AI rebuild..."):
+                                try:
+                                    startup_manager = get_startup_manager()
+                                    startup_manager.force_rebuild()
+                                    st.success("✅ Full rebuild completed!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Rebuild failed: {e}")
+                    
+                    # Toggle auto rebuild
+                    if enable_auto_rebuild:
+                        if st.button("⏸️ Pause Auto Rebuild", help="Stop automatic AI processing"):
+                            # Update .env to disable auto rebuild
+                            st.info("💡 To pause auto rebuild, set ENABLE_AUTO_AI_REBUILD=0 in .env file")
+                    else:
+                        if st.button("▶️ Resume Auto Rebuild", help="Enable automatic AI processing"):
+                            # Update .env to enable auto rebuild  
+                            st.info("💡 To resume auto rebuild, set ENABLE_AUTO_AI_REBUILD=1 in .env file")
+                
+                else:
+                    st.info("Add more models to enable cross-model comparison")
+                    
+            except Exception as e:
+                st.error(f"Cross-model analysis error: {e}")
+        else:
+            st.warning("Cross-model analyzer not initialized")
+        
         # Auto-Refresh System Status
         st.divider()
         st.subheader("Knowledge Base Monitor")
@@ -838,27 +1168,59 @@ def main():
         # Manual refresh button
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🔄 Refresh Now", help="Manually trigger knowledge base refresh"):
+            if st.button("🔄 Force Rebuild", help="Manually trigger knowledge base rebuild"):
                 try:
-                    auto_refresh = get_auto_refresh()
-                    auto_refresh.trigger_refresh()
-                    st.success("Refresh triggered!")
+                    startup_manager = get_startup_manager()
+                    startup_manager.force_rebuild()
+                    st.success("Rebuild triggered!")
                 except Exception as e:
-                    st.error(f"Refresh failed: {e}")
+                    st.error(f"Rebuild failed: {e}")
         
         with col2:
-            # Show last refresh info
+            # Show system status
             try:
-                auto_refresh = get_auto_refresh()
-                status = auto_refresh.get_status()
-                if status.get('last_refresh'):
-                    from datetime import datetime
-                    last_refresh = datetime.fromisoformat(status['last_refresh'])
-                    st.caption(f"Last: {last_refresh.strftime('%H:%M:%S')}")
+                startup_manager = get_startup_manager()
+                status = startup_manager.get_status()
+                if status.get('elapsed_time'):
+                    st.caption(f"Runtime: {status['elapsed_time']:.1f}s")
                 else:
-                    st.caption("No refreshes yet")
+                    st.caption("System initializing")
             except Exception:
                 st.caption("Status unavailable")
+        
+        # System Status Section
+        st.divider()
+        st.subheader("System Status")
+        
+        # Get current startup manager status
+        try:
+            startup_manager = get_startup_manager()
+            startup_status = startup_manager.get_status()
+            
+            # Show system readiness
+            if startup_status['is_ready']:
+                st.success("✅ **System Ready** - All components operational")
+                
+                # Show system statistics
+                if st.session_state.rebuild_recommendation:
+                    status = st.session_state.rebuild_recommendation
+                    st.caption(f"📄 Knowledge base: {status.get('total_files', 'Ready')}")
+                    
+                # Show startup time
+                if startup_status['elapsed_time'] > 0:
+                    st.caption(f"⚡ Startup time: {startup_status['elapsed_time']:.1f}s")
+                    
+            else:
+                # System still initializing
+                st.info(f"🔄 **Initializing:** {startup_status['message']}")
+                st.caption(f"⏱️ Elapsed: {startup_status['elapsed_time']:.1f}s")
+                
+        except Exception as e:
+            st.warning(f"⚠️ Status check failed: {e}")
+        
+        # Auto-refresh system info
+        st.caption("🤖 Automatic knowledge base management")
+        st.caption("🔄 Real-time change detection & updates")
         
         # Explore Graph button
         st.divider()
@@ -871,12 +1233,103 @@ def main():
     st.title("Knowledge Counselor v4.0")
     st.caption("Hybrid Graph-RAG Intelligence System with Memory")
     
-    # Add CSS for chat history styling
+    # Add CSS for chat history styling and enhanced input
     st.markdown("""
     <style>
+    /* Chat history styling */
     div[data-testid="stVerticalBlock"] > div:has(> hr) {
         max-height: 500px;
         overflow-y: auto;
+    }
+    
+    /* Enhanced chat input styling - Claude-like */
+    .stChatInput > div {
+        background-color: #f8f9fa;
+        border-radius: 12px;
+        border: 2px solid #e0e7ff;
+        transition: all 0.2s ease;
+    }
+    
+    .stChatInput > div:focus-within {
+        border-color: #4f46e5;
+        box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+        background-color: #ffffff;
+    }
+    
+    /* Make input area taller like Claude */
+    .stChatInput textarea {
+        min-height: 60px !important;
+        max-height: 200px !important;
+        font-size: 16px !important;
+        line-height: 1.5 !important;
+        padding: 12px 16px !important;
+        border-radius: 8px !important;
+        resize: vertical !important;
+    }
+    
+    /* Input placeholder styling */
+    .stChatInput textarea::placeholder {
+        color: #9ca3af !important;
+        font-style: italic;
+    }
+    
+    /* Send button styling */
+    .stChatInput button {
+        background-color: #4f46e5 !important;
+        border-radius: 8px !important;
+        height: 40px !important;
+        width: 40px !important;
+        margin-left: 8px !important;
+    }
+    
+    .stChatInput button:hover {
+        background-color: #4338ca !important;
+        transform: scale(1.05);
+    }
+    
+    /* Overall app styling improvements */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 0rem;
+        max-width: 900px;
+    }
+    
+    /* Improved title styling */
+    .main h1 {
+        color: #1f2937;
+        font-weight: 700;
+        letter-spacing: -0.025em;
+    }
+    
+    /* Caption styling */
+    .main .caption {
+        color: #6b7280;
+        font-size: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    
+    /* Chat messages styling */
+    .stChatMessage {
+        border-radius: 12px;
+        margin-bottom: 1rem;
+        border: 1px solid #e5e7eb;
+    }
+    
+    /* Sidebar improvements */
+    .css-1d391kg {
+        background-color: #f9fafb;
+    }
+    
+    /* Button improvements */
+    .stButton > button {
+        border-radius: 8px;
+        border: 1px solid #d1d5db;
+        transition: all 0.2s ease;
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
     </style>
     """, unsafe_allow_html=True)
@@ -917,7 +1370,7 @@ def main():
     
     # Claude-style input at bottom
     query = st.chat_input(
-        "Ask me anything about your selected models...",
+        "What would you like to know? Ask me about your knowledge base, code analysis, or anything else...",
         disabled=st.session_state.query_running or not selected_models
     )
     
@@ -929,6 +1382,11 @@ def main():
     if query and selected_models:
         st.session_state.query_running = True
         st.session_state.last_question = query
+        
+        # Check if this is a cross-model comparison query
+        is_comparison_query = _detect_cross_model_query(query, selected_models)
+        st.session_state.is_comparison_query = is_comparison_query
+        
         # Reset for new query
         st.session_state.reasoning_steps = {}
         st.session_state.thinking_stream = []
@@ -1024,6 +1482,7 @@ def create_graph_modal(selected_models: List[str]):
                 st.metric("Connected", "Yes" if stats['is_connected'] else "No")
             
             # Enhanced graph visualization using graphviz with physics layout
+            total_nodes = stats['total_nodes']
             if total_nodes > 0:
                 # Create a force-directed graph layout instead of hierarchical
                 dot_graph = "digraph G {\n"

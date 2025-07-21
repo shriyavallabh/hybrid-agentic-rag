@@ -1,355 +1,557 @@
 """
-Cross-Model Analysis Engine
-Specialized system for comparing and analyzing relationships between different models
-using the hybrid graph-RAG architecture.
+Robust Cross-Model Analysis System for Hundreds of Models
+Provides comprehensive comparison capabilities across multiple knowledge bases.
 """
+import os
+import json
+import pickle
 import logging
-from typing import Dict, List, Any, Tuple
+from pathlib import Path
+from typing import Dict, List, Any, Tuple, Optional, Set
 import time
+from dataclasses import dataclass
+import networkx as nx
+import numpy as np
+from openai import OpenAI
+from dotenv import load_dotenv
 
-from .hybrid_agent_runner import HybridAgentRunner
-
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class ModelMetadata:
+    """Metadata for a single model."""
+    model_id: str
+    name: str
+    file_count: int
+    entity_count: int
+    relationship_count: int
+    last_updated: float
+    size_mb: float
+    description: str = ""
+
+
+@dataclass
+class CrossModelRelationship:
+    """Represents a relationship between entities from different models."""
+    source_model: str
+    target_model: str
+    source_entity: str
+    target_entity: str
+    relationship_type: str
+    confidence: float
+    description: str
+
+
+@dataclass
+class ComparisonResult:
+    """Result of comparing two or more models."""
+    models_compared: List[str]
+    comparison_summary: str
+    key_differences: List[Dict[str, Any]]
+    similarities: List[Dict[str, Any]]
+    recommendations: List[str]
+    confidence: float
+
+
 class CrossModelAnalyzer:
-    """Specialized analyzer for cross-model comparisons and relationships."""
+    """Advanced cross-model analysis system for hundreds of models."""
     
-    def __init__(self, hybrid_runner: HybridAgentRunner):
-        self.hybrid_runner = hybrid_runner
-        self.comparison_cache = {}
+    def __init__(self, knowledge_base_path: str = "knowledge_base", 
+                 enhanced_kg_path: str = "enhanced_kg",
+                 rag_index_path: str = "rag_index"):
+        self.kb_path = Path(knowledge_base_path)
+        self.kg_path = Path(enhanced_kg_path)
+        self.rag_path = Path(rag_index_path)
+        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        # Model registry and caches
+        self.models: Dict[str, ModelMetadata] = {}
+        self.model_graphs: Dict[str, nx.MultiDiGraph] = {}
+        self.cross_model_relationships: List[CrossModelRelationship] = []
+        self.similarity_cache: Dict[Tuple[str, str], float] = {}
+        
+        # Load system
+        self._discover_models()
+        self._load_cross_model_index()
     
-    def comprehensive_model_comparison(self, model1: str, model2: str) -> Dict:
-        """Perform comprehensive comparison between two models."""
-        logger.info(f"🔬 Comprehensive model comparison: {model1} vs {model2}")
+    def _discover_models(self):
+        """Discover all available models in the knowledge base."""
+        logger.info("🔍 Discovering models in knowledge base...")
         
-        # Check cache first
-        cache_key = f"{model1}_vs_{model2}"
-        if cache_key in self.comparison_cache:
-            logger.info("📚 Using cached comparison result")
-            return self.comparison_cache[cache_key]
+        if not self.kb_path.exists():
+            logger.warning(f"Knowledge base path {self.kb_path} does not exist")
+            return
         
-        start_time = time.time()
+        for model_dir in self.kb_path.iterdir():
+            if model_dir.is_dir() and model_dir.name.startswith('model_'):
+                model_id = model_dir.name
+                metadata = self._analyze_model_metadata(model_id, model_dir)
+                self.models[model_id] = metadata
+                logger.info(f"📊 Discovered {model_id}: {metadata.file_count} files, {metadata.entity_count} entities")
         
-        # Multi-dimensional comparison queries
-        comparison_dimensions = [
-            self._analyze_performance_comparison(model1, model2),
-            self._analyze_methodology_comparison(model1, model2),
-            self._analyze_dataset_usage(model1, model2),
-            self._analyze_capability_differences(model1, model2),
-            self._analyze_historical_relationship(model1, model2)
-        ]
-        
-        # Synthesize comprehensive comparison
-        synthesis = self._synthesize_model_comparison(model1, model2, comparison_dimensions)
-        
-        processing_time = time.time() - start_time
-        
-        result = {
-            'model1': model1,
-            'model2': model2,
-            'performance_comparison': comparison_dimensions[0],
-            'methodology_comparison': comparison_dimensions[1],
-            'dataset_analysis': comparison_dimensions[2],
-            'capability_analysis': comparison_dimensions[3],
-            'historical_relationship': comparison_dimensions[4],
-            'comprehensive_synthesis': synthesis,
-            'processing_time': processing_time,
-            'analysis_timestamp': time.time()
-        }
-        
-        # Cache result
-        self.comparison_cache[cache_key] = result
-        
-        logger.info(f"✅ Model comparison completed in {processing_time:.1f} seconds")
-        return result
+        logger.info(f"✅ Total models discovered: {len(self.models)}")
     
-    def _analyze_performance_comparison(self, model1: str, model2: str) -> Dict:
-        """Analyze performance differences between models."""
-        query = f"Compare the performance metrics, accuracy, and evaluation results between {model1} and {model2}. Include specific numbers, benchmarks, and performance data."
+    def _analyze_model_metadata(self, model_id: str, model_dir: Path) -> ModelMetadata:
+        """Analyze metadata for a single model."""
+        # Count files
+        file_count = len(list(model_dir.rglob("*.*")))
+        
+        # Calculate size
+        total_size = sum(f.stat().st_size for f in model_dir.rglob("*.*") if f.is_file())
+        size_mb = total_size / (1024 * 1024)
+        
+        # Get graph metadata if available
+        graph_meta_path = self.kg_path / model_id / "graph" / "metadata.json"
+        entity_count = 0
+        relationship_count = 0
+        last_updated = time.time()
+        
+        if graph_meta_path.exists():
+            try:
+                with open(graph_meta_path, 'r') as f:
+                    graph_meta = json.load(f)
+                entity_count = graph_meta.get('nodes', 0)
+                relationship_count = graph_meta.get('edges', 0)
+                last_updated = graph_meta.get('created_at', time.time())
+            except Exception as e:
+                logger.warning(f"Failed to load graph metadata for {model_id}: {e}")
+        
+        return ModelMetadata(
+            model_id=model_id,
+            name=model_id.replace('_', ' ').title(),
+            file_count=file_count,
+            entity_count=entity_count,
+            relationship_count=relationship_count,
+            last_updated=last_updated,
+            size_mb=size_mb
+        )
+    
+    def _load_model_graph(self, model_id: str) -> Optional[nx.MultiDiGraph]:
+        """Load knowledge graph for a specific model (with caching)."""
+        if model_id in self.model_graphs:
+            return self.model_graphs[model_id]
+        
+        graph_path = self.kg_path / model_id / "graph" / "enhanced_graph.pkl"
+        if not graph_path.exists():
+            logger.warning(f"No graph found for {model_id}")
+            return None
         
         try:
-            result = self.hybrid_runner.query(query)
-            return {
-                'dimension': 'performance',
-                'analysis': result.answer,
-                'confidence': result.confidence,
-                'sources': result.citations
-            }
+            with open(graph_path, 'rb') as f:
+                graph = pickle.load(f)
+            self.model_graphs[model_id] = graph
+            logger.info(f"📊 Loaded graph for {model_id}: {graph.number_of_nodes()} nodes")
+            return graph
         except Exception as e:
-            logger.error(f"Performance comparison failed: {e}")
-            return {'dimension': 'performance', 'analysis': 'Analysis failed', 'confidence': 0.0}
+            logger.error(f"Failed to load graph for {model_id}: {e}")
+            return None
     
-    def _analyze_methodology_comparison(self, model1: str, model2: str) -> Dict:
-        """Analyze methodological differences between models."""
-        query = f"Compare the methodologies, algorithms, architectures, and technical approaches used in {model1} versus {model2}. What are the key technical differences?"
+    def _load_cross_model_index(self):
+        """Load or build cross-model relationship index."""
+        index_path = self.kg_path / "cross_model_relationships.json"
         
-        try:
-            result = self.hybrid_runner.query(query)
-            return {
-                'dimension': 'methodology',
-                'analysis': result.answer,
-                'confidence': result.confidence,
-                'sources': result.citations
-            }
-        except Exception as e:
-            logger.error(f"Methodology comparison failed: {e}")
-            return {'dimension': 'methodology', 'analysis': 'Analysis failed', 'confidence': 0.0}
+        if index_path.exists():
+            try:
+                with open(index_path, 'r') as f:
+                    data = json.load(f)
+                self.cross_model_relationships = [
+                    CrossModelRelationship(**rel) for rel in data
+                ]
+                logger.info(f"📋 Loaded {len(self.cross_model_relationships)} cross-model relationships")
+            except Exception as e:
+                logger.error(f"Failed to load cross-model index: {e}")
+        else:
+            logger.info("🔨 Cross-model index not found, will build on first comparison")
     
-    def _analyze_dataset_usage(self, model1: str, model2: str) -> Dict:
-        """Analyze dataset usage and data requirements."""
-        query = f"Compare the datasets, data requirements, and data processing approaches used by {model1} and {model2}. Do they share datasets or use different data sources?"
+    def build_cross_model_relationships(self, model_ids: Optional[List[str]] = None):
+        """Build cross-model relationships using AI analysis."""
+        if model_ids is None:
+            model_ids = list(self.models.keys())
         
-        try:
-            result = self.hybrid_runner.query(query)
-            return {
-                'dimension': 'datasets',
-                'analysis': result.answer,
-                'confidence': result.confidence,
-                'sources': result.citations
-            }
-        except Exception as e:
-            logger.error(f"Dataset analysis failed: {e}")
-            return {'dimension': 'datasets', 'analysis': 'Analysis failed', 'confidence': 0.0}
+        logger.info(f"🔨 Building cross-model relationships for {len(model_ids)} models...")
+        
+        relationships = []
+        for i, model_a in enumerate(model_ids):
+            for model_b in model_ids[i+1:]:
+                model_relationships = self._analyze_model_pair(model_a, model_b)
+                relationships.extend(model_relationships)
+        
+        self.cross_model_relationships = relationships
+        self._save_cross_model_index()
+        logger.info(f"✅ Built {len(relationships)} cross-model relationships")
     
-    def _analyze_capability_differences(self, model1: str, model2: str) -> Dict:
-        """Analyze capability and feature differences."""
-        query = f"What are the different capabilities, features, and use cases of {model1} compared to {model2}? What can each model do that the other cannot?"
+    def _analyze_model_pair(self, model_a: str, model_b: str) -> List[CrossModelRelationship]:
+        """Analyze relationships between two specific models using AI."""
+        logger.info(f"🔍 Analyzing relationship: {model_a} ↔ {model_b}")
         
-        try:
-            result = self.hybrid_runner.query(query)
-            return {
-                'dimension': 'capabilities',
-                'analysis': result.answer,
-                'confidence': result.confidence,
-                'sources': result.citations
-            }
-        except Exception as e:
-            logger.error(f"Capability analysis failed: {e}")
-            return {'dimension': 'capabilities', 'analysis': 'Analysis failed', 'confidence': 0.0}
+        graph_a = self._load_model_graph(model_a)
+        graph_b = self._load_model_graph(model_b)
+        
+        if not graph_a or not graph_b:
+            logger.warning(f"Missing graphs for {model_a} or {model_b}")
+            return []
+        
+        # Extract top entities from each model
+        entities_a = self._get_top_entities(graph_a, model_a, limit=50)
+        entities_b = self._get_top_entities(graph_b, model_b, limit=50)
+        
+        # Use AI to find relationships
+        relationships = self._ai_detect_cross_model_relationships(
+            model_a, entities_a, model_b, entities_b
+        )
+        
+        return relationships
     
-    def _analyze_historical_relationship(self, model1: str, model2: str) -> Dict:
-        """Analyze historical relationship and evolution."""
-        query = f"What is the historical relationship between {model1} and {model2}? Does one build on the other, are they competing approaches, or are they complementary?"
+    def _get_top_entities(self, graph: nx.MultiDiGraph, model_id: str, limit: int = 50) -> List[Dict]:
+        """Get top entities from a model's knowledge graph."""
+        entities = []
         
-        try:
-            result = self.hybrid_runner.query(query)
-            return {
-                'dimension': 'relationship',
-                'analysis': result.answer,
-                'confidence': result.confidence,
-                'sources': result.citations
-            }
-        except Exception as e:
-            logger.error(f"Relationship analysis failed: {e}")
-            return {'dimension': 'relationship', 'analysis': 'Analysis failed', 'confidence': 0.0}
+        # Sort nodes by degree (most connected first)
+        node_degrees = dict(graph.degree())
+        sorted_nodes = sorted(node_degrees.items(), key=lambda x: x[1], reverse=True)
+        
+        for node_id, degree in sorted_nodes[:limit]:
+            node_data = graph.nodes[node_id]
+            entities.append({
+                'id': node_id,
+                'name': node_data.get('name', str(node_id)),
+                'type': node_data.get('type', 'Unknown'),
+                'description': node_data.get('description', ''),
+                'degree': degree
+            })
+        
+        return entities
     
-    def _synthesize_model_comparison(self, model1: str, model2: str, 
-                                   dimensions: List[Dict]) -> Dict:
-        """Synthesize comprehensive model comparison across all dimensions."""
+    def _ai_detect_cross_model_relationships(self, model_a: str, entities_a: List[Dict],
+                                           model_b: str, entities_b: List[Dict]) -> List[CrossModelRelationship]:
+        """Use AI to detect relationships between entities from different models."""
         
-        # Prepare synthesis context
-        synthesis_context = []
-        all_sources = set()
+        # Prepare entity summaries
+        summary_a = "\n".join([
+            f"- {e['name']} ({e['type']}): {e['description'][:100]}"
+            for e in entities_a[:20]
+        ])
         
-        for dim in dimensions:
-            if dim.get('analysis') and dim['analysis'] != 'Analysis failed':
-                synthesis_context.append(f"**{dim['dimension'].title()}:** {dim['analysis']}")
-                all_sources.update(dim.get('sources', []))
+        summary_b = "\n".join([
+            f"- {e['name']} ({e['type']}): {e['description'][:100]}"
+            for e in entities_b[:20]
+        ])
         
-        context_text = "\n\n".join(synthesis_context)
-        
-        synthesis_query = f"Based on this comprehensive analysis across multiple dimensions, provide a synthesized comparison of {model1} vs {model2}. Highlight the key differences, strengths, weaknesses, and overall relationship."
-        
+        prompt = f"""Analyze these two models and identify relationships between their entities:
+
+MODEL {model_a.upper()} - Top Entities:
+{summary_a}
+
+MODEL {model_b.upper()} - Top Entities:
+{summary_b}
+
+Find semantic relationships between entities from different models. Return JSON:
+{{
+  "relationships": [
+    {{
+      "source_entity": "entity_name_from_model_a",
+      "target_entity": "entity_name_from_model_b", 
+      "relationship_type": "similar|equivalent|related|implements|extends|uses",
+      "confidence": 0.0-1.0,
+      "description": "brief explanation"
+    }}
+  ]
+}}
+
+Focus on meaningful relationships with confidence > 0.6."""
+
         try:
-            # Use the hybrid runner for synthesis
-            synthesis_prompt = f"""Synthesize this comprehensive model comparison:
-
-Models: {model1} vs {model2}
-
-Multi-dimensional Analysis:
-{context_text[:4000]}
-
-Provide a synthesized summary that:
-1. Highlights key differences and similarities
-2. Identifies strengths and weaknesses of each model
-3. Explains the relationship between the models
-4. Provides actionable insights for users
-
-Synthesis:"""
-
-            response = self.hybrid_runner.client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model="gpt-4o",
-                temperature=0.0,
-                max_tokens=600,
-                messages=[{"role": "user", "content": synthesis_prompt}]
+                temperature=0.1,
+                max_tokens=2000,
+                messages=[
+                    {"role": "system", "content": "You are an expert at analyzing relationships between software systems and models."},
+                    {"role": "user", "content": prompt}
+                ]
             )
             
-            synthesis = response.choices[0].message.content.strip()
-            self.hybrid_runner.token_tracker.add_usage(response.usage.total_tokens)
+            result = response.choices[0].message.content.strip()
             
-            return {
-                'synthesis': synthesis,
-                'sources': list(all_sources),
-                'confidence': self._calculate_synthesis_confidence(dimensions)
+            # Parse JSON response
+            json_start = result.find('{')
+            json_end = result.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                json_str = result[json_start:json_end]
+                parsed = json.loads(json_str)
+                
+                relationships = []
+                for rel in parsed.get('relationships', []):
+                    if rel['confidence'] > 0.6:  # Only high-confidence relationships
+                        relationships.append(CrossModelRelationship(
+                            source_model=model_a,
+                            target_model=model_b,
+                            source_entity=rel['source_entity'],
+                            target_entity=rel['target_entity'],
+                            relationship_type=rel['relationship_type'],
+                            confidence=rel['confidence'],
+                            description=rel['description']
+                        ))
+                
+                logger.info(f"🔗 Found {len(relationships)} relationships between {model_a} and {model_b}")
+                return relationships
+                
+        except Exception as e:
+            logger.error(f"AI relationship detection failed: {e}")
+        
+        return []
+    
+    def _save_cross_model_index(self):
+        """Save cross-model relationships to disk."""
+        index_path = self.kg_path / "cross_model_relationships.json"
+        
+        # Ensure directory exists
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        data = [
+            {
+                'source_model': rel.source_model,
+                'target_model': rel.target_model,
+                'source_entity': rel.source_entity,
+                'target_entity': rel.target_entity,
+                'relationship_type': rel.relationship_type,
+                'confidence': rel.confidence,
+                'description': rel.description
             }
-            
-        except Exception as e:
-            logger.error(f"Synthesis failed: {e}")
-            return {'synthesis': 'Synthesis failed', 'sources': [], 'confidence': 0.0}
-    
-    def _calculate_synthesis_confidence(self, dimensions: List[Dict]) -> float:
-        """Calculate confidence for synthesis based on dimension confidences."""
-        valid_dimensions = [d for d in dimensions if d.get('confidence', 0) > 0]
-        
-        if not valid_dimensions:
-            return 0.0
-        
-        avg_confidence = sum(d['confidence'] for d in valid_dimensions) / len(valid_dimensions)
-        
-        # Boost confidence if we have multiple successful dimensions
-        dimension_bonus = min(0.1, (len(valid_dimensions) - 1) * 0.02)
-        
-        return min(0.95, avg_confidence + dimension_bonus)
-    
-    def analyze_model_ecosystem(self, models: List[str]) -> Dict:
-        """Analyze the entire ecosystem of models and their relationships."""
-        logger.info(f"🌐 Analyzing model ecosystem: {models}")
-        
-        ecosystem_analysis = {
-            'models': models,
-            'pairwise_relationships': {},
-            'ecosystem_insights': {},
-            'model_clusters': [],
-            'evolution_timeline': [],
-            'performance_rankings': {}
-        }
-        
-        # Analyze pairwise relationships
-        for i, model1 in enumerate(models):
-            for model2 in models[i+1:]:
-                relationship = self._analyze_model_relationship(model1, model2)
-                ecosystem_analysis['pairwise_relationships'][f"{model1}_vs_{model2}"] = relationship
-        
-        # Generate ecosystem insights
-        ecosystem_insights = self._generate_ecosystem_insights(ecosystem_analysis['pairwise_relationships'])
-        ecosystem_analysis['ecosystem_insights'] = ecosystem_insights
-        
-        return ecosystem_analysis
-    
-    def _analyze_model_relationship(self, model1: str, model2: str) -> Dict:
-        """Analyze the relationship between two models."""
-        query = f"What is the relationship between {model1} and {model2}? Are they competing approaches, does one build on the other, or are they complementary? Include any performance comparisons."
-        
-        try:
-            result = self.hybrid_runner.query(query)
-            return {
-                'relationship_type': self._classify_relationship_type(result.answer),
-                'description': result.answer,
-                'confidence': result.confidence,
-                'sources': result.citations
-            }
-        except Exception as e:
-            logger.error(f"Relationship analysis failed: {e}")
-            return {'relationship_type': 'unknown', 'description': 'Analysis failed', 'confidence': 0.0}
-    
-    def _classify_relationship_type(self, description: str) -> str:
-        """Classify the type of relationship between models."""
-        description_lower = description.lower()
-        
-        if any(word in description_lower for word in ['builds on', 'extends', 'improves', 'successor']):
-            return 'evolutionary'
-        elif any(word in description_lower for word in ['competing', 'alternative', 'versus', 'compared']):
-            return 'competitive'
-        elif any(word in description_lower for word in ['complementary', 'together', 'combined', 'ensemble']):
-            return 'complementary'
-        elif any(word in description_lower for word in ['similar', 'same', 'equivalent']):
-            return 'similar'
-        else:
-            return 'related'
-    
-    def _generate_ecosystem_insights(self, pairwise_relationships: Dict) -> Dict:
-        """Generate insights about the overall model ecosystem."""
-        
-        relationship_types = {}
-        for rel_data in pairwise_relationships.values():
-            rel_type = rel_data.get('relationship_type', 'unknown')
-            relationship_types[rel_type] = relationship_types.get(rel_type, 0) + 1
-        
-        insights = {
-            'relationship_distribution': relationship_types,
-            'dominant_relationship_type': max(relationship_types.items(), key=lambda x: x[1])[0] if relationship_types else 'unknown',
-            'ecosystem_maturity': 'high' if relationship_types.get('evolutionary', 0) > 0 else 'emerging',
-            'competition_level': 'high' if relationship_types.get('competitive', 0) > len(pairwise_relationships) * 0.5 else 'low'
-        }
-        
-        return insights
-    
-    def find_similar_models(self, target_model: str, similarity_threshold: float = 0.7) -> List[Dict]:
-        """Find models similar to the target model."""
-        logger.info(f"🔍 Finding models similar to: {target_model}")
-        
-        query = f"Find models that are similar to {target_model} in terms of methodology, approach, or capabilities. What models solve similar problems or use similar techniques?"
-        
-        try:
-            result = self.hybrid_runner.query(query)
-            
-            # Extract model names from the response (simple extraction)
-            # In a more sophisticated version, this would use NER or structured extraction
-            similar_models = self._extract_model_names_from_text(result.answer)
-            
-            return [{
-                'model': model,
-                'similarity_reason': result.answer,
-                'confidence': result.confidence,
-                'sources': result.citations
-            } for model in similar_models if model.lower() != target_model.lower()]
-            
-        except Exception as e:
-            logger.error(f"Similar model search failed: {e}")
-            return []
-    
-    def _extract_model_names_from_text(self, text: str) -> List[str]:
-        """Extract model names from text (simple implementation)."""
-        # This is a simple implementation - could be enhanced with NER
-        potential_models = []
-        
-        # Look for common model patterns
-        import re
-        
-        # Pattern for models like "GPT-4", "BERT", "ResNet-50", etc.
-        model_patterns = [
-            r'\b[A-Z][a-zA-Z]*[-\s]*\d+[a-zA-Z]*\b',  # GPT-4, ResNet-50, etc.
-            r'\b[A-Z]{2,}[a-zA-Z]*\b',  # BERT, GPT, etc.
-            r'\b[A-Z][a-z]+[A-Z][a-z]+\b'  # CamelCase models
+            for rel in self.cross_model_relationships
         ]
         
-        for pattern in model_patterns:
-            matches = re.findall(pattern, text)
-            potential_models.extend(matches)
+        with open(index_path, 'w') as f:
+            json.dump(data, f, indent=2)
         
-        # Filter and clean
-        cleaned_models = []
-        for model in potential_models:
-            if len(model) > 2 and model not in cleaned_models:
-                cleaned_models.append(model)
-        
-        return cleaned_models[:5]  # Return top 5 candidates
+        logger.info(f"💾 Saved cross-model index with {len(data)} relationships")
     
-    def get_comparison_summary(self, model1: str, model2: str) -> str:
-        """Get a quick comparison summary between two models."""
-        cache_key = f"{model1}_vs_{model2}"
+    def compare_models(self, model_ids: List[str], comparison_query: str) -> ComparisonResult:
+        """Compare multiple models based on a specific query."""
+        logger.info(f"🔍 Comparing models {model_ids} for: {comparison_query}")
         
-        if cache_key in self.comparison_cache:
-            comparison = self.comparison_cache[cache_key]
-            return comparison.get('comprehensive_synthesis', {}).get('synthesis', 'No summary available')
+        # Load relevant data for each model
+        model_data = {}
+        for model_id in model_ids:
+            model_data[model_id] = {
+                'metadata': self.models.get(model_id),
+                'graph': self._load_model_graph(model_id),
+                'relevant_entities': self._find_relevant_entities(model_id, comparison_query)
+            }
         
-        # If not cached, perform quick comparison
-        query = f"Provide a brief comparison summary of {model1} vs {model2} highlighting the key differences."
+        # Use AI to perform comparison
+        comparison = self._ai_compare_models(model_data, comparison_query)
         
+        return comparison
+    
+    def _find_relevant_entities(self, model_id: str, query: str) -> List[Dict]:
+        """Find entities relevant to the comparison query."""
+        graph = self._load_model_graph(model_id)
+        if not graph:
+            return []
+        
+        # Simple relevance scoring based on name/description matching
+        relevant_entities = []
+        query_words = set(query.lower().split())
+        
+        for node_id in graph.nodes():
+            node_data = graph.nodes[node_id]
+            entity_text = f"{node_data.get('name', '')} {node_data.get('description', '')}".lower()
+            
+            # Calculate relevance score
+            matches = sum(1 for word in query_words if word in entity_text)
+            if matches > 0:
+                relevant_entities.append({
+                    'id': node_id,
+                    'name': node_data.get('name', str(node_id)),
+                    'type': node_data.get('type', 'Unknown'),
+                    'description': node_data.get('description', ''),
+                    'relevance_score': matches / len(query_words)
+                })
+        
+        # Sort by relevance and return top entities
+        relevant_entities.sort(key=lambda x: x['relevance_score'], reverse=True)
+        return relevant_entities[:20]
+    
+    def _ai_compare_models(self, model_data: Dict[str, Dict], query: str) -> ComparisonResult:
+        """Use AI to perform detailed model comparison."""
+        
+        # Prepare comparison context
+        model_summaries = []
+        for model_id, data in model_data.items():
+            metadata = data['metadata']
+            entities = data['relevant_entities']
+            
+            entity_summary = "\n".join([
+                f"  - {e['name']} ({e['type']}): {e['description'][:100]}"
+                for e in entities[:10]
+            ])
+            
+            model_summaries.append(f"""
+{model_id.upper()}:
+- Files: {metadata.file_count if metadata else 'Unknown'}
+- Entities: {metadata.entity_count if metadata else 'Unknown'}
+- Size: {metadata.size_mb:.1f}MB
+- Relevant entities for '{query}':
+{entity_summary}
+""")
+        
+        prompt = f"""Compare these models based on the query: "{query}"
+
+{chr(10).join(model_summaries)}
+
+Cross-model relationships:
+{self._get_relevant_cross_relationships(list(model_data.keys()))}
+
+Provide a comprehensive comparison in JSON format:
+{{
+  "comparison_summary": "High-level comparison overview",
+  "key_differences": [
+    {{"aspect": "specific area", "model_a": "description", "model_b": "description", "significance": "high|medium|low"}}
+  ],
+  "similarities": [
+    {{"aspect": "shared feature", "description": "how they're similar", "models": ["model1", "model2"]}}
+  ],
+  "recommendations": ["actionable insights"],
+  "confidence": 0.0-1.0
+}}"""
+
         try:
-            result = self.hybrid_runner.query(query)
-            return result.answer
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                temperature=0.2,
+                max_tokens=3000,
+                messages=[
+                    {"role": "system", "content": "You are an expert at comparing and analyzing software systems, models, and architectures."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            result = response.choices[0].message.content.strip()
+            
+            # Parse JSON response
+            json_start = result.find('{')
+            json_end = result.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                json_str = result[json_start:json_end]
+                parsed = json.loads(json_str)
+                
+                return ComparisonResult(
+                    models_compared=list(model_data.keys()),
+                    comparison_summary=parsed.get('comparison_summary', ''),
+                    key_differences=parsed.get('key_differences', []),
+                    similarities=parsed.get('similarities', []),
+                    recommendations=parsed.get('recommendations', []),
+                    confidence=parsed.get('confidence', 0.7)
+                )
+                
         except Exception as e:
-            logger.error(f"Quick comparison failed: {e}")
-            return "Comparison unavailable"
+            logger.error(f"AI comparison failed: {e}")
+        
+        # Fallback comparison
+        return ComparisonResult(
+            models_compared=list(model_data.keys()),
+            comparison_summary=f"Basic comparison of {len(model_data)} models",
+            key_differences=[],
+            similarities=[],
+            recommendations=["Enable detailed AI comparison by checking system logs"],
+            confidence=0.3
+        )
+    
+    def _get_relevant_cross_relationships(self, model_ids: List[str]) -> str:
+        """Get cross-model relationships relevant to the models being compared."""
+        relevant_rels = [
+            rel for rel in self.cross_model_relationships
+            if rel.source_model in model_ids and rel.target_model in model_ids
+        ]
+        
+        if not relevant_rels:
+            return "No cross-model relationships found."
+        
+        rel_text = []
+        for rel in relevant_rels[:10]:  # Limit to avoid token overflow
+            rel_text.append(
+                f"- {rel.source_entity} ({rel.source_model}) {rel.relationship_type} "
+                f"{rel.target_entity} ({rel.target_model}): {rel.description}"
+            )
+        
+        return "\n".join(rel_text)
+    
+    def get_model_statistics(self) -> Dict[str, Any]:
+        """Get comprehensive statistics about all models."""
+        if not self.models:
+            return {"error": "No models found"}
+        
+        total_files = sum(m.file_count for m in self.models.values())
+        total_entities = sum(m.entity_count for m in self.models.values())
+        total_size = sum(m.size_mb for m in self.models.values())
+        
+        return {
+            "total_models": len(self.models),
+            "total_files": total_files,
+            "total_entities": total_entities,
+            "total_size_mb": total_size,
+            "cross_relationships": len(self.cross_model_relationships),
+            "models": {
+                model_id: {
+                    "files": meta.file_count,
+                    "entities": meta.entity_count,
+                    "size_mb": meta.size_mb,
+                    "last_updated": meta.last_updated
+                }
+                for model_id, meta in self.models.items()
+            }
+        }
+    
+    def find_similar_models(self, target_model: str, similarity_threshold: float = 0.7) -> List[Tuple[str, float]]:
+        """Find models similar to the target model."""
+        if target_model not in self.models:
+            return []
+        
+        similar_models = []
+        for model_id in self.models:
+            if model_id != target_model:
+                similarity = self._calculate_model_similarity(target_model, model_id)
+                if similarity >= similarity_threshold:
+                    similar_models.append((model_id, similarity))
+        
+        similar_models.sort(key=lambda x: x[1], reverse=True)
+        return similar_models
+    
+    def _calculate_model_similarity(self, model_a: str, model_b: str) -> float:
+        """Calculate similarity between two models."""
+        cache_key = tuple(sorted([model_a, model_b]))
+        if cache_key in self.similarity_cache:
+            return self.similarity_cache[cache_key]
+        
+        # Calculate similarity based on:
+        # 1. Shared entities/concepts
+        # 2. Similar file structure
+        # 3. Cross-model relationships
+        
+        meta_a = self.models[model_a]
+        meta_b = self.models[model_b]
+        
+        # Basic metadata similarity
+        size_similarity = 1 - abs(meta_a.size_mb - meta_b.size_mb) / max(meta_a.size_mb, meta_b.size_mb, 1)
+        entity_similarity = 1 - abs(meta_a.entity_count - meta_b.entity_count) / max(meta_a.entity_count, meta_b.entity_count, 1)
+        
+        # Cross-relationship bonus
+        relationships = [
+            rel for rel in self.cross_model_relationships
+            if (rel.source_model == model_a and rel.target_model == model_b) or
+               (rel.source_model == model_b and rel.target_model == model_a)
+        ]
+        relationship_bonus = min(len(relationships) * 0.1, 0.4)
+        
+        similarity = (size_similarity * 0.3 + entity_similarity * 0.3 + relationship_bonus * 0.4)
+        
+        self.similarity_cache[cache_key] = similarity
+        return similarity
+
+
+def create_cross_model_analyzer() -> CrossModelAnalyzer:
+    """Factory function to create cross-model analyzer."""
+    return CrossModelAnalyzer()
