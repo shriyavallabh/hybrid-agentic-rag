@@ -239,16 +239,55 @@ class SmartRebuildManager:
         return changes
     
     def _check_build_outputs_exist(self) -> bool:
-        """Check if expected build outputs exist."""
-        required_outputs = [
-            'rag_index/chunks.pkl',
-            'rag_index/faiss.index',
-            'enhanced_kg/enhanced_graph.pkl'
-        ]
+        """Check if expected build outputs exist for all models."""
+        # Check if any model directories exist in knowledge_base
+        model_dirs = []
+        kb_path = Path("knowledge_base")
+        if kb_path.exists():
+            for item in kb_path.iterdir():
+                if item.is_dir() and item.name.startswith('model_'):
+                    model_dirs.append(item.name)
         
-        for output in required_outputs:
-            if not (Path(output)).exists():
-                logger.info(f"Missing build output: {output}")
+        if not model_dirs:
+            return True  # No models to check
+        
+        # Check each model has proper outputs
+        for model_id in model_dirs:
+            # Check if model has files
+            model_path = kb_path / model_id
+            model_files = list(model_path.rglob("*.*")) if model_path.exists() else []
+            
+            if not model_files:
+                continue  # Skip empty models
+            
+            # Check for model-specific outputs
+            model_graph_path = Path(f"enhanced_kg/{model_id}/graph/enhanced_graph.pkl")
+            model_rag_path = Path(f"rag_index/{model_id}/chunks.pkl")
+            
+            if not model_graph_path.exists():
+                logger.info(f"Missing model graph for {model_id}: {model_graph_path}")
+                return False
+                
+            if not model_rag_path.exists():
+                logger.info(f"Missing model RAG index for {model_id}: {model_rag_path}")
+                return False
+            
+            # Check if outputs have actual content (not empty)
+            try:
+                import pickle
+                with open(model_graph_path, 'rb') as f:
+                    graph = pickle.load(f)
+                if graph.number_of_nodes() == 0:
+                    logger.info(f"Empty graph for {model_id}")
+                    return False
+                    
+                with open(model_rag_path, 'rb') as f:
+                    chunks = pickle.load(f)
+                if len(chunks) == 0:
+                    logger.info(f"Empty chunks for {model_id}")
+                    return False
+            except Exception as e:
+                logger.info(f"Failed to verify outputs for {model_id}: {e}")
                 return False
         
         return True
